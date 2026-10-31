@@ -471,11 +471,11 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 if (target == PlaybackEngineType.VLC) {
                     VlcEngine(appContext, settings, mode)
                 } else {
-                    Media3Engine(appContext, settings, mode)
+                    Media3Engine(appContext, settings, mode, container.streamProxy)
                 }
             }.getOrElse {
                 fallbackMessage = "VLC engine unavailable · using Media3"
-                Media3Engine(appContext, settings, mode)
+                Media3Engine(appContext, settings, mode, container.streamProxy)
             }
             engine = created
             _state.update {

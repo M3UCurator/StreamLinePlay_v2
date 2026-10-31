@@ -57,6 +57,7 @@ class SettingsRepository(private val context: Context) {
         val referer = stringPreferencesKey("referer")
         val origin = stringPreferencesKey("origin")
         val authorization = stringPreferencesKey("authorization")
+        val streamProxy = booleanPreferencesKey("stream_proxy")
         val epgRefreshMode = stringPreferencesKey("epg_refresh_mode")
         val globalEpgUrls = stringPreferencesKey("global_epg_urls")
         val clearCacheOnExit = booleanPreferencesKey("clear_cache_on_exit")
@@ -100,6 +101,7 @@ class SettingsRepository(private val context: Context) {
         referer = this[Keys.referer].orEmpty(),
         origin = this[Keys.origin].orEmpty(),
         authorization = this[Keys.authorization].orEmpty(),
+        streamProxyEnabled = this[Keys.streamProxy] ?: true,
         epgRefreshMode = enumOr(Keys.epgRefreshMode, EpgRefreshMode.AUTO_24H),
         globalEpgUrls = this[Keys.globalEpgUrls]
             ?.lineSequence()
@@ -152,6 +154,7 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.referer] = settings.referer
             prefs[Keys.origin] = settings.origin
             prefs[Keys.authorization] = settings.authorization
+            prefs[Keys.streamProxy] = settings.streamProxyEnabled
             prefs[Keys.epgRefreshMode] = settings.epgRefreshMode.name
             prefs[Keys.globalEpgUrls] = settings.globalEpgUrls.joinToString("\n")
             prefs[Keys.clearCacheOnExit] = settings.clearCacheOnExit

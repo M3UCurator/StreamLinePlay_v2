@@ -16,7 +16,6 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultDataSource
-import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
@@ -26,6 +25,7 @@ import com.streamline.play.data.model.AspectMode
 import com.streamline.play.data.model.DecoderMode
 import com.streamline.play.data.model.MediaItem
 import com.streamline.play.data.settings.AppSettings
+import com.streamline.play.player.proxy.StreamProxyServer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -41,6 +41,7 @@ class Media3Engine(
     private val context: Context,
     private val settings: AppSettings,
     private val decoderMode: DecoderMode,
+    private val proxy: StreamProxyServer? = null,
 ) : PlaybackEngine {
 
     override val kind: EngineKind = EngineKind.MEDIA3
@@ -52,6 +53,12 @@ class Media3Engine(
     private val audioLookup = mutableMapOf<String, TrackRef>()
     private val subtitleLookup = mutableMapOf<String, TrackRef>()
     private val recoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val adaptiveBuffer = AdaptiveBufferManager(settings.bufferTuning)
+    private val adaptiveLoadControl =
+        AdaptiveLoadControl(adaptiveBuffer, settings.bufferTuning.targetBytes)
+    private var appliedExtraBufferMs = 0
+    private var playedOnce = false
+    private var playingSinceMs = 0L
 
     private var currentItem: MediaItem? = null
     private var currentHeaders: Map<String, String> = emptyMap()
@@ -105,29 +112,27 @@ class Media3Engine(
             .build()
 
         val trackSelector = DefaultTrackSelector(context, trackParameters)
-        val tuning = settings.bufferTuning
-        val loadControl = DefaultLoadControl.Builder()
-            .setTargetBufferBytes(tuning.targetBytes)
-            .setBufferDurationsMs(
-                tuning.minBufferMs,
-                tuning.maxBufferMs,
-                tuning.playbackBufferMs,
-                tuning.rebufferMs,
-            )
-            .build()
 
         player = ExoPlayer.Builder(context)
             .setRenderersFactory(renderers)
             .setTrackSelector(trackSelector)
-            .setLoadControl(loadControl)
+            .setLoadControl(adaptiveLoadControl)
             .build()
         player.addListener(object : Player.Listener {
-            override fun onPlaybackStateChanged(playbackState: Int) = publish()
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) playedOnce = true
+                if (playbackState == Player.STATE_BUFFERING) escalateBuffer()
+                publish()
+            }
+
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (isPlaying) {
                     stallRetries = 0
                     recovering = false
+                    playingSinceMs = SystemClock.elapsedRealtime()
                     _snapshot.update { it.copy(recovering = false, fatal = false, error = null) }
+                } else {
+                    playingSinceMs = 0L
                 }
                 publish()
             }
@@ -157,6 +162,11 @@ class Media3Engine(
         recovering = false
         lastStallCheckMs = 0L
         lastStallPositionMs = 0L
+        playedOnce = false
+        playingSinceMs = 0L
+        appliedExtraBufferMs = 0
+        adaptiveBuffer.reset()
+        adaptiveLoadControl.refresh()
         _snapshot.value = EngineSnapshot(buffering = true)
         startCandidate(candidates.firstOrNull() ?: item.url, currentStartPositionMs)
     }
@@ -222,30 +232,69 @@ class Media3Engine(
             )
         }
         watchForStall()
+        releaseReserveWhenStable()
     }
 
     override fun release() {
         recoveryScope.cancel()
+        proxy?.clearAllowedHosts()
+        proxy?.updateSessionHeaders(emptyMap())
         runCatching { player.release() }
     }
+
+    /** Drops the extra reserve after a minute of uninterrupted playback. */
+    private fun releaseReserveWhenStable() {
+        if (!adaptiveBuffer.hasExtra || !player.isPlaying) return
+        val now = SystemClock.elapsedRealtime()
+        if (playingSinceMs == 0L) {
+            playingSinceMs = now
+            return
+        }
+        if (now - playingSinceMs < adaptiveBuffer.stableWindowMs) return
+        adaptiveBuffer.onStablePlayback()
+        appliedExtraBufferMs = 0
+        adaptiveLoadControl.refresh()
+        playingSinceMs = now
+    }
+
+    private fun escalateBuffer() {
+        if (!playedOnce || recovering) return
+        val extra = adaptiveBuffer.onFreeze()
+        if (extra == appliedExtraBufferMs) return
+        appliedExtraBufferMs = extra
+        adaptiveLoadControl.refresh()
+    }
+
+    private fun shouldProxy(url: String): Boolean =
+        proxy != null && settings.streamProxyEnabled && isHlsUrl(url)
 
     private fun startCandidate(url: String, positionMs: Long) {
         val item = currentItem ?: return
         val activeUrl = candidates.getOrNull(candidateIndex) ?: url
         val profile = headerProfiles.getOrNull(headerIndex)
         val headers = profile?.headers ?: currentHeaders
-        val http = StreamNetworking.httpFactory(
-            profile?.headers?.get("User-Agent") ?: settings.userAgent,
-            headers,
-        )
-        val dataSource: DataSource.Factory =
-            if (!item.isLive) StreamNetworking.cachedFactory(context, http) ?: DefaultDataSource.Factory(context, http)
-            else DefaultDataSource.Factory(context, http)
+        val userAgent = headers.headerValue("User-Agent") ?: settings.userAgent
+
+        val proxied = shouldProxy(activeUrl)
+        val playbackUrl = if (proxied) {
+            proxy?.updateSessionHeaders(headers)
+            proxy?.allowHosts(candidates)
+            proxy?.urlFor(activeUrl) ?: activeUrl
+        } else {
+            activeUrl
+        }
+
+        val http = PlayerDataSources.httpFactory(userAgent, headers)
+        val dataSource: DataSource.Factory = when {
+            proxied || item.isLive -> DefaultDataSource.Factory(context, http)
+            else -> StreamNetworking.cachedFactory(context, http)
+                ?: DefaultDataSource.Factory(context, http)
+        }
         val sourceFactory = DefaultMediaSourceFactory(dataSource)
             .setLoadErrorHandlingPolicy(StreamRetryPolicy(MAX_SILENT_RETRIES))
 
         val builder = ExoItem.Builder()
-            .setUri(activeUrl)
+            .setUri(playbackUrl)
             .setMediaId(item.id)
         streamMime(activeUrl)?.let(builder::setMimeType)
         if (currentSubtitles.isNotEmpty()) {
@@ -544,8 +593,11 @@ class Media3Engine(
                 .filter { !it.hardwareAccelerated }
         }
 
+        private fun isHlsUrl(url: String): Boolean =
+            url.contains(".m3u8", true) || url.contains("type=m3u", true)
+
         private fun streamMime(url: String): String? = when {
-            url.contains(".m3u8", true) || url.contains("type=m3u", true) -> MimeTypes.APPLICATION_M3U8
+            isHlsUrl(url) -> MimeTypes.APPLICATION_M3U8
             url.contains(".mpd", true) -> MimeTypes.APPLICATION_MPD
             else -> null
         }

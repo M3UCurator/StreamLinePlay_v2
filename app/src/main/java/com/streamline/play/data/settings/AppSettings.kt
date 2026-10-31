@@ -33,6 +33,8 @@ data class AppSettings(
     val referer: String = "",
     val origin: String = "",
     val authorization: String = "",
+    /** Routes HLS playback through the signed loopback proxy. */
+    val streamProxyEnabled: Boolean = true,
     val epgRefreshMode: EpgRefreshMode = EpgRefreshMode.AUTO_24H,
     /** App-wide XMLTV guides applied to every loaded playlist. */
     val globalEpgUrls: List<String> = emptyList(),

@@ -745,6 +745,16 @@ private fun androidx.compose.foundation.lazy.LazyListScope.networkSection(
 ) {
     item {
         SettingRow(
+            label = "Native stream proxy",
+            value = if (settings.streamProxyEnabled) "On" else "Off",
+            caption = "HLS plays through a signed loopback proxy that fixes CORS, headers and HTTP/HTTPS redirects",
+            onClick = {
+                vm.updateSettings { it.copy(streamProxyEnabled = !it.streamProxyEnabled) }
+            },
+        )
+    }
+    item {
+        SettingRow(
             label = "User-Agent preset",
             value = settings.userAgentPreset.label,
             caption = settings.userAgent,
