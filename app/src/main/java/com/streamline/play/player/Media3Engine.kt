@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class Media3Engine(
     private val context: Context,
@@ -55,6 +56,8 @@ class Media3Engine(
     private val subtitleLookup = mutableMapOf<String, TrackRef>()
     private val recoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var recoveryJob: Job? = null
+    private var probeJob: Job? = null
+    private val probedFormats = HashMap<String, String?>()
     private val adaptiveBuffer = AdaptiveBufferManager(settings.bufferTuning)
     private val adaptiveLoadControl =
         AdaptiveLoadControl(adaptiveBuffer, settings.bufferTuning.targetBytes)
@@ -156,6 +159,7 @@ class Media3Engine(
         subtitleUrls: List<String>,
     ) {
         recoveryJob?.cancel()
+        probeJob?.cancel()
         currentItem = item
         currentSubtitles = subtitleUrls
         currentHeaders = settings.requestHeaders + item.headers
@@ -176,7 +180,30 @@ class Media3Engine(
         adaptiveBuffer.reset()
         adaptiveLoadControl.refresh()
         _snapshot.value = EngineSnapshot(buffering = true)
-        startCandidate(candidates.firstOrNull() ?: item.url, currentStartPositionMs)
+        val startUrl = candidates.firstOrNull() ?: item.url
+        if (streamMime(startUrl) == null && !probedFormats.containsKey(startUrl)) {
+            probeFormatThenStart(startUrl, currentStartPositionMs)
+        } else {
+            startCandidate(startUrl, currentStartPositionMs)
+        }
+    }
+
+    /**
+     * Extension-less links (shorteners, redirect endpoints) are sniffed once so the matching
+     * HLS/DASH source is used instead of a progressive source that cannot parse a manifest.
+     */
+    private fun probeFormatThenStart(url: String, positionMs: Long) {
+        probeJob = recoveryScope.launch {
+            val result = withContext(Dispatchers.IO) {
+                StreamFormatProbe.probe(url, currentHeaders)
+            }
+            if (currentItem == null) return@launch
+            if (result.reachable) {
+                if (probedFormats.size >= MAX_PROBED_FORMATS) probedFormats.clear()
+                probedFormats[url] = result.mimeType
+            }
+            startCandidate(url, positionMs)
+        }
     }
 
     override fun play() {
@@ -245,6 +272,7 @@ class Media3Engine(
 
     override fun release() {
         recoveryJob?.cancel()
+        probeJob?.cancel()
         recoveryScope.cancel()
         locks.release()
         proxy?.clearAllowedHosts()
@@ -277,7 +305,8 @@ class Media3Engine(
     }
 
     private fun shouldProxy(url: String): Boolean =
-        proxy != null && settings.streamProxyEnabled && isHlsUrl(url)
+        proxy != null && settings.streamProxyEnabled &&
+            (isHlsUrl(url) || probedFormats[url] == MimeTypes.APPLICATION_M3U8)
 
     private fun startCandidate(url: String, positionMs: Long) {
         val item = currentItem ?: return
@@ -307,7 +336,7 @@ class Media3Engine(
         val builder = ExoItem.Builder()
             .setUri(playbackUrl)
             .setMediaId(item.id)
-        streamMime(activeUrl)?.let(builder::setMimeType)
+        (streamMime(activeUrl) ?: probedFormats[activeUrl])?.let(builder::setMimeType)
         if (currentSubtitles.isNotEmpty()) {
             builder.setSubtitleConfigurations(currentSubtitles.map(::subtitleConfiguration))
         }
@@ -610,6 +639,7 @@ class Media3Engine(
         private const val MAX_SILENT_RETRIES = 3
         private const val RECONNECT_DELAY_MS = 900L
         private const val STALL_TIMEOUT_MS = 15_000L
+        private const val MAX_PROBED_FORMATS = 64
         private const val VLC_UA = "VLC/3.0.20 LibVLC/3.0.20"
         private const val DEFAULT_EXO_UA = "ExoPlayerLib/2.18.1"
         private const val BROWSER_UA =

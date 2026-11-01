@@ -117,6 +117,53 @@ class StreamProxyServerTest {
     }
 
     @Test
+    fun followsRelativeRedirectBeforeRewriting() {
+        upstream.respond(
+            "/live/start.m3u8",
+            Response("text/html", ByteArray(0), status = 302, location = "master.m3u8"),
+        )
+
+        val masterText = URL(proxy.urlFor(directUrl("/live/start.m3u8"))).readText()
+
+        assertTrue(masterText.startsWith("#EXTM3U"))
+        assertTrue(masterText.contains("http://127.0.0.1:${proxy.localPort}/p?u="))
+    }
+
+    @Test
+    fun followsAbsoluteRedirectAndBasesChildUrlsOnTheFinalHop() {
+        upstream.respond(
+            "/live/short",
+            Response("text/html", ByteArray(0), status = 307, location = directUrl("/live/master.m3u8")),
+        )
+
+        val masterText = URL(proxy.urlFor(directUrl("/live/short"))).readText()
+        val variantUrl = masterText.lineSequence().first { it.startsWith("http") }
+        val variantText = URL(variantUrl).readText()
+        val segmentUrl = variantText.lineSequence().first { it.startsWith("http") }
+
+        val decoded = java.net.URLDecoder.decode(
+            variantUrl.substringAfter("/p?u=").substringBefore("&s="),
+            "UTF-8",
+        )
+        assertEquals(directUrl("/live/variant/index.m3u8"), decoded)
+        assertArrayEquals(segmentBytes, URL(segmentUrl).readBytes())
+    }
+
+    @Test
+    fun failsWhenTheRedirectChainNeverEnds() {
+        for (hop in 0..10) {
+            upstream.respond(
+                "/loop/$hop",
+                Response("text/html", ByteArray(0), status = 302, location = "http://127.0.0.1:${upstream.port}/loop/${hop + 1}"),
+            )
+        }
+
+        val connection = URL(proxy.urlFor(directUrl("/loop/0"))).openConnection() as HttpURLConnection
+
+        assertEquals(502, connection.responseCode)
+    }
+
+    @Test
     fun allowsHostsRegisteredByThePlaybackSession() {
         proxy.allowHosts(listOf(directUrl("/live/master.m3u8")))
         val target = URLEncoder.encode(directUrl("/live/master.m3u8"), "UTF-8")
@@ -144,17 +191,27 @@ class StreamProxyServerTest {
             status to text.substringAfter("\r\n\r\n", "")
         }
 
-    private data class Response(val contentType: String, val body: ByteArray) {
+    private data class Response(
+        val contentType: String,
+        val body: ByteArray,
+        val status: Int = 200,
+        val location: String? = null,
+    ) {
         constructor(contentType: String, body: String) : this(contentType, body.toByteArray())
     }
 
-    private class UpstreamServer(private val responses: Map<String, Response>) {
+    private class UpstreamServer(routes: Map<String, Response>) {
 
+        private val responses = java.util.concurrent.ConcurrentHashMap(routes)
         private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
         private val requestHeaders = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
         val port: Int get() = socket.localPort
 
         fun headersFor(path: String): Map<String, String> = requestHeaders[path].orEmpty()
+
+        fun respond(path: String, response: Response) {
+            responses[path] = response
+        }
 
         init {
             thread(name = "test-upstream", isDaemon = true) {
@@ -195,13 +252,15 @@ class StreamProxyServerTest {
                     )
                     output.write(body)
                 } else {
-                    output.write(
-                        (
-                            "HTTP/1.1 200 OK\r\nContent-Type: ${response.contentType}\r\n" +
-                                "Content-Length: ${response.body.size}\r\nConnection: close\r\n\r\n"
-                            ).toByteArray(),
-                    )
-                    output.write(response.body)
+                    val builder = StringBuilder("HTTP/1.1 ${response.status} Status\r\n")
+                    builder.append("Content-Type: ${response.contentType}\r\n")
+                    response.location?.let { builder.append("Location: $it\r\n") }
+                    if (response.status !in 300..399) {
+                        builder.append("Content-Length: ${response.body.size}\r\n")
+                    }
+                    builder.append("Connection: close\r\n\r\n")
+                    output.write(builder.toString().toByteArray())
+                    if (response.status !in 300..399) output.write(response.body)
                 }
                 output.flush()
             }

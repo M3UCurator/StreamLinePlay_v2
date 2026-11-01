@@ -3,28 +3,39 @@ package com.streamline.play.data.net
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
 import java.io.File
 import java.io.IOException
-import java.net.HttpURLConnection
-import java.net.URL
-import java.util.zip.GZIPInputStream
+import java.util.concurrent.ConcurrentHashMap
 
+/**
+ * GET helper for playlists, guides and portal APIs.
+ *
+ * Short links and cross-host redirects are handed to OkHttp, which resolves each Location
+ * and renegotiates TLS when the chain upgrades from http to https.
+ */
 class HttpFetcher {
+
+    private val clients = ConcurrentHashMap<Int, OkHttpClient>()
 
     suspend fun download(
         url: String,
         headers: Map<String, String>,
         target: File,
-        timeoutMs: Int = 20_000,
+        timeoutMs: Int = DEFAULT_TIMEOUT_MS,
         attempts: Int = 3,
     ): File = withContext(Dispatchers.IO) {
         target.parentFile?.mkdirs()
         var last: Throwable? = null
         repeat(attempts.coerceAtLeast(1)) { attempt ->
             runCatching {
-                fetch(url, headers, timeoutMs).use { input ->
+                fetch(url, headers, timeoutMs).use { response ->
+                    val body = response.body ?: throw IOException("HTTP ${response.code} without body")
                     target.outputStream().use { output ->
-                        input.copyTo(output, 32 * 1024)
+                        body.byteStream().use { input -> input.copyTo(output, COPY_BUFFER_BYTES) }
                     }
                 }
             }.onSuccess {
@@ -40,20 +51,23 @@ class HttpFetcher {
     suspend fun getText(
         url: String,
         headers: Map<String, String> = emptyMap(),
-        timeoutMs: Int = 20_000,
+        timeoutMs: Int = DEFAULT_TIMEOUT_MS,
     ): String = String(getBytes(url, headers, timeoutMs), Charsets.UTF_8)
 
     suspend fun getBytes(
         url: String,
         headers: Map<String, String> = emptyMap(),
-        timeoutMs: Int = 20_000,
+        timeoutMs: Int = DEFAULT_TIMEOUT_MS,
         attempts: Int = 3,
         maxBytes: Int = MAX_PAYLOAD_BYTES,
     ): ByteArray = withContext(Dispatchers.IO) {
         var last: Throwable? = null
         repeat(attempts.coerceAtLeast(1)) { attempt ->
             runCatching {
-                fetch(url, headers, timeoutMs).use { readCapped(it, maxBytes) }
+                fetch(url, headers, timeoutMs).use { response ->
+                    val body = response.body ?: throw IOException("HTTP ${response.code} without body")
+                    body.byteStream().use { readCapped(it, maxBytes) }
+                }
             }.onSuccess {
                 return@withContext it
             }.onFailure { error ->
@@ -91,49 +105,50 @@ class HttpFetcher {
         url: String,
         headers: Map<String, String>,
         timeoutMs: Int,
-    ): java.io.InputStream {
-        var current = URL(url)
-        repeat(6) {
-            val connection = (current.openConnection() as HttpURLConnection).apply {
-                connectTimeout = timeoutMs
-                readTimeout = timeoutMs
-                instanceFollowRedirects = false
-                requestMethod = "GET"
-                setRequestProperty("Accept", "*/*")
-                setRequestProperty("Accept-Encoding", "gzip")
-                headers.forEach { (name, value) -> setRequestProperty(name, value) }
-            }
-            val code = connection.responseCode
-            if (code in 300..399) {
-                val location = connection.getHeaderField("Location")
-                    ?: throw IOException("HTTP $code without redirect location")
-                runCatching { connection.inputStream.use { it.read() } }
-                connection.disconnect()
-                current = URL(current, location)
-                return@repeat
-            }
-            if (code !in 200..299) {
-                val message = runCatching {
-                    connection.errorStream?.use { stream ->
-                        stream.bufferedReader().readText().take(400)
-                    }
-                }.getOrNull()
-                connection.disconnect()
-                throw IOException("HTTP $code${if (message.isNullOrBlank()) "" else ": $message"}")
-            }
-            val raw = connection.inputStream
-            val encoding = connection.contentEncoding
-            val stream = if (encoding?.contains("gzip", ignoreCase = true) == true) {
-                GZIPInputStream(raw)
-            } else {
-                raw
-            }
-            return stream
+    ): Response {
+        val parsed = url.toHttpUrlOrNull() ?: throw IOException("Invalid URL: $url")
+        val builder = Request.Builder().url(parsed).get().header("Accept", "*/*")
+        headers.forEach { (name, value) ->
+            if (isForwardableHeader(name)) runCatching { builder.header(name, value) }
         }
-        throw IOException("Too many redirects")
+        val client = clients.getOrPut(timeoutMs) { HttpClients.redirecting(timeoutMs, timeoutMs) }
+        val response = client.newCall(builder.build()).execute()
+        if (!response.isSuccessful) {
+            val code = response.code
+            val detail = runCatching { response.peekBody(ERROR_SNIPPET_BYTES).string() }.getOrNull()
+            response.close()
+            throw IOException("HTTP $code${if (detail.isNullOrBlank()) "" else ": $detail"}")
+        }
+        return response
+    }
+
+    /**
+     * Leaves Accept-Encoding to OkHttp so gzip is negotiated and decoded transparently, and
+     * rejects framing headers that callers must not override on a bodyless GET.
+     */
+    private fun isForwardableHeader(name: String): Boolean {
+        if (name.isBlank() || name.any { it <= ' ' || it == ':' }) return false
+        return name.lowercase() !in EXCLUDED_HEADERS
     }
 
     companion object {
         const val MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
+
+        private const val DEFAULT_TIMEOUT_MS = 20_000
+        private const val COPY_BUFFER_BYTES = 32 * 1024
+        private const val ERROR_SNIPPET_BYTES = 400L
+
+        private val EXCLUDED_HEADERS = setOf(
+            "host",
+            "connection",
+            "proxy-connection",
+            "keep-alive",
+            "transfer-encoding",
+            "content-length",
+            "upgrade",
+            "te",
+            "trailer",
+            "accept-encoding",
+        )
     }
 }

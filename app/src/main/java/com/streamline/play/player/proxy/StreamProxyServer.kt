@@ -1,18 +1,22 @@
 package com.streamline.play.player.proxy
 
+import com.streamline.play.data.net.HttpClients
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.ResponseBody
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.PushbackInputStream
-import java.net.HttpURLConnection
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.net.URI
-import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicBoolean
@@ -33,6 +37,9 @@ class StreamProxyServer(
 ) {
 
     private val signer = ProxySigner()
+    private val http: OkHttpClient by lazy {
+        HttpClients.manualRedirects(CONNECT_TIMEOUT_MS, READ_TIMEOUT_MS)
+    }
     private val allowlist = CopyOnWriteArraySet<String>()
     private val cookieJars = ConcurrentHashMap<String, MutableMap<String, String>>()
     private val liveSockets = ConcurrentHashMap<Socket, Unit>()
@@ -175,22 +182,22 @@ class StreamProxyServer(
     }
 
     private fun deliver(success: FetchResult.Success, request: ProxyRequest, output: OutputStream) {
-        val connection = success.connection
+        val response = success.response
         try {
-            val errorStream = runCatching { connection.inputStream }.getOrNull()
-            if (errorStream == null) {
+            val body = response.body
+            if (body == null) {
                 writeText(output, 502, "Upstream body unavailable")
                 return
             }
-            val gzip = connection.getHeaderField("Content-Encoding")?.contains("gzip", true) == true
-            val raw = if (gzip) GZIPInputStream(errorStream) else errorStream
-            val input = PushbackInputStream(raw, PREFIX_SIZE)
+            val gzip = response.header("Content-Encoding")?.contains("gzip", true) == true
+            val raw = body.byteStream()
+            val input = PushbackInputStream(if (gzip) GZIPInputStream(raw) else raw, PREFIX_SIZE)
 
             val prefix = ByteArray(PREFIX_SIZE)
             val prefixCount = input.read(prefix)
             if (prefixCount > 0) input.unread(prefix, 0, prefixCount)
 
-            val declaredLength = connection.contentLength.toLong()
+            val declaredLength = body.contentLength()
             val manifest = prefixCount > 0 &&
                 startsWithPlaylistHeader(prefix, prefixCount) &&
                 (declaredLength < 0 || declaredLength <= MAX_PLAYLIST_BYTES)
@@ -203,101 +210,103 @@ class StreamProxyServer(
                 )
 
                 manifest -> {
-                    val body = readAll(input)
-                    if (body == null) {
+                    val bytes = readAll(input)
+                    if (bytes == null) {
                         writeText(output, 502, "Playlist too large")
                         return
                     }
                     val playlist = ManifestRewriter.rewrite(
-                        body.toString(Charsets.UTF_8),
+                        bytes.toString(Charsets.UTF_8),
                         success.target.toString(),
                         ::urlFor,
                     )
                     writePlaylist(output, playlist)
                 }
 
-                else -> streamBody(output, connection, input, gzip, request.method == "HEAD")
+                else -> streamBody(output, response, body, input, gzip, request.method == "HEAD")
             }
         } catch (_: Exception) {
         } finally {
-            runCatching { connection.disconnect() }
+            runCatching { response.close() }
         }
     }
 
+    /**
+     * Walks the redirect chain one hop at a time. OkHttp dials each hop (including the TLS
+     * handshake for an http -> https upgrade) while every new target is validated by the
+     * guard, which would be skipped if OkHttp followed redirects on its own.
+     */
     private fun open(target: URI, request: ProxyRequest, redirects: Int): FetchResult {
-        val connection = runCatching {
-            (URL(target.toString()).openConnection() as HttpURLConnection).apply {
-                instanceFollowRedirects = false
-                useCaches = false
-                connectTimeout = CONNECT_TIMEOUT_MS
-                readTimeout = READ_TIMEOUT_MS
-                requestMethod = if (request.method == "HEAD") "HEAD" else "GET"
-                applyUpstreamHeaders(target, request)
+        val call = runCatching { http.newCall(upstreamRequest(target, request)) }
+            .getOrElse { return FetchResult.Failure(502, "Invalid upstream target") }
+        val response = runCatching { call.execute() }.getOrElse { error ->
+            return if (error is SocketTimeoutException) {
+                FetchResult.Failure(504, "Upstream timeout")
+            } else {
+                FetchResult.Failure(502, "Upstream unavailable")
             }
-        }.getOrElse {
-            return FetchResult.Failure(502, "Upstream unavailable")
         }
-
-        val code = runCatching { connection.responseCode }.getOrElse {
-            connection.disconnect()
-            return FetchResult.Failure(504, "Upstream timeout")
-        }
-        storeCookies(target.host, connection)
+        storeCookies(target.host, response)
+        val code = response.code
 
         if (code in 300..399) {
-            val location = connection.getHeaderField("Location")
-            connection.disconnect()
-            if (location.isNullOrBlank() || redirects >= MAX_REDIRECTS) {
+            val location = response.header("Location")?.trim()
+            val next = location
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { runCatching { response.request.url.resolve(it) }.getOrNull() }
+            response.close()
+            if (next == null || redirects >= MAX_REDIRECTS) {
                 return FetchResult.Failure(502, "Upstream redirect failed")
             }
-            val next = ProxyGuard.parseTarget(
-                ManifestRewriter.resolve(target.toString(), location),
-                allowLoopbackTargets,
-            ) ?: return FetchResult.Failure(502, "Upstream redirect blocked")
-            return open(next, request, redirects + 1)
+            val parsed = ProxyGuard.parseTarget(next.toString(), allowLoopbackTargets)
+                ?: return FetchResult.Failure(502, "Upstream redirect blocked")
+            return open(parsed, request, redirects + 1)
         }
         if (code !in 200..299) {
-            connection.disconnect()
+            response.close()
             return FetchResult.Failure(code, "Upstream $code")
         }
-        return FetchResult.Success(target, connection)
+        return FetchResult.Success(target, response)
     }
 
-    private fun HttpURLConnection.applyUpstreamHeaders(target: URI, request: ProxyRequest) {
-        setRequestProperty("Accept", "*/*")
-        setRequestProperty("Accept-Encoding", "identity")
+    private fun upstreamRequest(target: URI, request: ProxyRequest): Request {
+        val builder = Request.Builder()
+            .url(target.toString())
+            .apply { if (request.method == "HEAD") head() else get() }
+            .header("Accept", "*/*")
+            .header("Accept-Encoding", "identity")
         sessionHeaders.forEach { (name, value) ->
-            if (!name.equals("Accept", true)) {
-                runCatching { setRequestProperty(name, value) }
-            }
+            if (!name.equals("Accept", true)) runCatching { builder.header(name, value) }
         }
         if (sessionHeaders.keys.none { it.equals("User-Agent", true) }) {
-            setRequestProperty("User-Agent", DEFAULT_UA)
+            builder.header("User-Agent", DEFAULT_UA)
         }
-        cookieHeader(target.host)?.let { setRequestProperty("Cookie", it) }
+        cookieHeader(target.host)?.let { builder.header("Cookie", it) }
         if (!looksLikePlaylistPath(target)) {
-            request.headers["range"]?.takeIf { it.isNotBlank() }?.let { setRequestProperty("Range", it) }
+            request.headers["range"]?.takeIf { it.isNotBlank() }?.let { builder.header("Range", it) }
         }
+        return builder.build()
     }
 
     private fun streamBody(
         output: OutputStream,
-        connection: HttpURLConnection,
+        response: Response,
+        body: ResponseBody,
         input: InputStream,
         gzip: Boolean,
         headOnly: Boolean,
     ) {
-        val declaredLength = connection.contentLength.toLong()
+        val declaredLength = body.contentLength()
         val headers = mutableListOf(
-            "Content-Type" to (connection.contentType ?: "application/octet-stream"),
+            "Content-Type" to (response.header("Content-Type") ?: "application/octet-stream"),
         )
         headers += CORS_HEADERS
-        connection.getHeaderField("Accept-Ranges")?.let { headers += "Accept-Ranges" to it }
-        connection.getHeaderField("Content-Range")?.let { headers += "Content-Range" to it }
+        response.header("Accept-Ranges")?.let { headers += "Accept-Ranges" to it }
+        response.header("Content-Range")?.let { headers += "Content-Range" to it }
         if (!gzip && declaredLength >= 0) {
             headers += "Content-Length" to declaredLength.toString()
         }
-        writeHead(output, connection.responseCode, headers)
+        writeHead(output, response.code, headers)
         if (headOnly) return
 
         val buffer = ByteArray(COPY_BUFFER_BYTES)
@@ -316,22 +325,19 @@ class StreamProxyServer(
         return allowlist.contains(host)
     }
 
-    private fun storeCookies(host: String?, connection: HttpURLConnection) {
+    private fun storeCookies(host: String?, response: Response) {
         if (host.isNullOrBlank()) return
+        val cookies = response.headers.values("Set-Cookie")
+        if (cookies.isEmpty()) return
         if (cookieJars.size >= MAX_COOKIE_HOSTS && !cookieJars.containsKey(host.lowercase())) {
             cookieJars.keys.firstOrNull()?.let(cookieJars::remove)
         }
         val jar = cookieJars.getOrPut(host.lowercase()) { ConcurrentHashMap() }
-        runCatching {
-            connection.headerFields.forEach { (name, values) ->
-                if (name == null || !name.equals("Set-Cookie", true)) return@forEach
-                values?.forEach { raw ->
-                    val pair = raw.substringBefore(';')
-                    val separator = pair.indexOf('=')
-                    if (separator > 0 && jar.size < MAX_COOKIES_PER_HOST) {
-                        jar[pair.substring(0, separator).trim()] = pair.substring(separator + 1).trim()
-                    }
-                }
+        cookies.forEach { raw ->
+            val pair = raw.substringBefore(';')
+            val separator = pair.indexOf('=')
+            if (separator > 0 && jar.size < MAX_COOKIES_PER_HOST) {
+                jar[pair.substring(0, separator).trim()] = pair.substring(separator + 1).trim()
             }
         }
     }
@@ -467,7 +473,7 @@ class StreamProxyServer(
     }
 
     private sealed interface FetchResult {
-        class Success(val target: URI, val connection: HttpURLConnection) : FetchResult
+        class Success(val target: URI, val response: Response) : FetchResult
         class Failure(val status: Int, val message: String) : FetchResult
     }
 
