@@ -91,6 +91,32 @@ class StreamProxyServerTest {
     }
 
     @Test
+    fun forwardsInjectedHeadersToManifestAndSegments() {
+        proxy.updateSessionHeaders(
+            mapOf(
+                "User-Agent" to "PipeAgent/1.0",
+                "Referer" to "https://portal.example/",
+                "Authorization" to "Bearer token123",
+            ),
+        )
+
+        val masterText = URL(proxy.urlFor(directUrl("/live/master.m3u8"))).readText()
+        val variantUrl = masterText.lineSequence().first { it.startsWith("http") }
+        val variantText = URL(variantUrl).readText()
+        val segmentUrl = variantText.lineSequence().first { it.startsWith("http") }
+        URL(segmentUrl).readBytes()
+
+        val masterHeaders = upstream.headersFor("/live/master.m3u8")
+        assertEquals("PipeAgent/1.0", masterHeaders["user-agent"])
+        assertEquals("https://portal.example/", masterHeaders["referer"])
+        assertEquals("Bearer token123", masterHeaders["authorization"])
+
+        val segmentHeaders = upstream.headersFor("/live/variant/seg/one.ts")
+        assertEquals("PipeAgent/1.0", segmentHeaders["user-agent"])
+        assertEquals("Bearer token123", segmentHeaders["authorization"])
+    }
+
+    @Test
     fun allowsHostsRegisteredByThePlaybackSession() {
         proxy.allowHosts(listOf(directUrl("/live/master.m3u8")))
         val target = URLEncoder.encode(directUrl("/live/master.m3u8"), "UTF-8")
@@ -125,7 +151,10 @@ class StreamProxyServerTest {
     private class UpstreamServer(private val responses: Map<String, Response>) {
 
         private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        private val requestHeaders = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
         val port: Int get() = socket.localPort
+
+        fun headersFor(path: String): Map<String, String> = requestHeaders[path].orEmpty()
 
         init {
             thread(name = "test-upstream", isDaemon = true) {
@@ -144,11 +173,18 @@ class StreamProxyServerTest {
             client.use {
                 val reader = client.getInputStream().bufferedReader()
                 val requestLine = reader.readLine() ?: return
+                val headers = LinkedHashMap<String, String>()
                 while (true) {
                     val line = reader.readLine() ?: break
                     if (line.isEmpty()) break
+                    val colon = line.indexOf(':')
+                    if (colon > 0) {
+                        headers[line.substring(0, colon).trim().lowercase()] =
+                            line.substring(colon + 1).trim()
+                    }
                 }
                 val path = requestLine.split(' ').getOrNull(1).orEmpty()
+                requestHeaders[path] = headers
                 val response = responses[path]
                 val output = client.getOutputStream()
                 if (response == null) {

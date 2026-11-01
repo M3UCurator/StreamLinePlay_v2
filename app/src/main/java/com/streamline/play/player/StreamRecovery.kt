@@ -6,7 +6,10 @@ import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
 import com.streamline.play.data.model.MediaItem
+import java.io.EOFException
 import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 
@@ -64,6 +67,8 @@ fun PlaybackException.streamFailure(): StreamFailure {
         errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT ||
             errorCode == PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE ->
             "Network timeout while loading the stream."
+        errorCode == PlaybackException.ERROR_CODE_IO_UNSPECIFIED ->
+            "Connection dropped while loading the stream."
         errorCode == PlaybackException.ERROR_CODE_DECODING_FAILED ||
             errorCode == PlaybackException.ERROR_CODE_DECODER_INIT_FAILED ||
             errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ||
@@ -75,6 +80,31 @@ fun PlaybackException.streamFailure(): StreamFailure {
         errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
         errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
     return StreamFailure(fatal = fatal, code = code, message = message)
+}
+
+/**
+ * True when the failure is a network hiccup rather than a rejected request, so a live
+ * channel can simply reopen the same source instead of walking the backup ladder.
+ */
+fun PlaybackException.isTransientIoError(): Boolean {
+    val chain = generateSequence<Throwable>(this) { it.cause }.toList()
+    val invalidResponse = chain.filterIsInstance<HttpDataSource.InvalidResponseCodeException>().firstOrNull()
+    if (invalidResponse != null) return StreamRetryPolicy.isTransientCode(invalidResponse.responseCode)
+    if (chain.any { it is UnknownHostException }) return true
+    return when (errorCode) {
+        PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED,
+        PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT,
+        PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND,
+        PlaybackException.ERROR_CODE_IO_READ_POSITION_OUT_OF_RANGE,
+        -> true
+        else -> chain.any {
+            it is SocketTimeoutException ||
+                it is SocketException ||
+                it is EOFException ||
+                it is InterruptedIOException
+        }
+    }
 }
 
 /**

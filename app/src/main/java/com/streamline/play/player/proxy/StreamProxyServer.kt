@@ -236,7 +236,7 @@ class StreamProxyServer(
         setRequestProperty("Accept", "*/*")
         setRequestProperty("Accept-Encoding", "identity")
         sessionHeaders.forEach { (name, value) ->
-            if (!name.equals("User-Agent", true) && !name.equals("Accept", true)) {
+            if (!name.equals("Accept", true)) {
                 runCatching { setRequestProperty(name, value) }
             }
         }
@@ -446,7 +446,9 @@ class StreamProxyServer(
 
     companion object {
         const val CONNECT_TIMEOUT_MS = 20_000
-        const val READ_TIMEOUT_MS = 20_000
+
+        /** Generous read window: live segments can be slow, short timeouts abort healthy streams. */
+        const val READ_TIMEOUT_MS = 60_000
 
         private const val LOOPBACK = "127.0.0.1"
         private const val BACKLOG = 50

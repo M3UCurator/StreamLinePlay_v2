@@ -4,6 +4,7 @@ import com.streamline.play.data.model.ContentType
 import com.streamline.play.data.model.EpgProgram
 import com.streamline.play.data.model.MediaItem
 import com.streamline.play.data.model.SourceConfig
+import com.streamline.play.data.model.StreamUrl
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
@@ -80,12 +81,13 @@ class M3uParser {
                         pending = null
                         return@forEach
                     }
-                    val (url, pipeHeaders) = splitPipeHeaders(line)
+                    val target = StreamUrl.parse(line)
+                    val url = target.url
                     if (!url.contains("://")) {
                         pending = null
                         return@forEach
                     }
-                    val headers = entry.headers.toMutableMap().apply { putAll(pipeHeaders) }
+                    val headers = entry.headers.toMutableMap().apply { putAll(target.headers) }
                     val name = entry.displayName.ifBlank {
                         entry.attrs["tvg-name"].orEmpty().ifBlank { "Unnamed" }
                     }
@@ -169,36 +171,6 @@ class M3uParser {
         return Pending(attrs = attrs, displayName = displayName)
     }
 
-    /** Splits `http://host/live.m3u8|User-Agent=…&Referer=…` into a URL and injected headers. */
-    private fun splitPipeHeaders(line: String): Pair<String, Map<String, String>> {
-        val pipe = line.indexOf('|')
-        if (pipe < 0) return line to emptyMap()
-        val url = line.take(pipe).trim()
-        val headers = LinkedHashMap<String, String>()
-        line.substring(pipe + 1)
-            .split('&', '|')
-            .forEach { pair ->
-                val eq = pair.indexOf('=')
-                if (eq <= 0) return@forEach
-                val name = pair.take(eq).trim()
-                val value = pair.substring(eq + 1).trim().trim('"', '\'')
-                if (name.isEmpty() || value.isEmpty()) return@forEach
-                headers[canonicalHeader(name)] = value
-            }
-        return url to headers
-    }
-
-    private fun canonicalHeader(name: String): String = when (name.lowercase(Locale.US)) {
-        "user-agent", "useragent", "ua" -> "User-Agent"
-        "referer", "referrer", "referer-url" -> "Referer"
-        "origin" -> "Origin"
-        "cookie" -> "Cookie"
-        "authorization", "auth" -> "Authorization"
-        else -> name.split('-', '_')
-            .filter { it.isNotBlank() }
-            .joinToString("-") { part -> part.replaceFirstChar { it.uppercaseChar() } }
-    }
-
     private fun lastCommaOutsideQuotes(text: String): Int {
         var inQuotes = false
         var last = -1
@@ -226,7 +198,7 @@ class M3uParser {
             lower.startsWith("http-header") -> {
                 val pair = value.split(':', limit = 2)
                 if (pair.size == 2 && pair[0].isNotBlank() && pair[1].isNotBlank()) {
-                    pending.headers[canonicalHeader(pair[0].trim())] = pair[1].trim()
+                    pending.headers[StreamUrl.canonicalHeader(pair[0].trim())] = pair[1].trim()
                 }
             }
         }

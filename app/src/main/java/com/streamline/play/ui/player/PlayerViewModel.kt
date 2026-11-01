@@ -16,6 +16,7 @@ import com.streamline.play.data.model.DecoderMode
 import com.streamline.play.data.model.ExternalPlayerApp
 import com.streamline.play.data.model.MediaItem
 import com.streamline.play.data.model.PlaybackEngineType
+import com.streamline.play.data.model.StreamUrl
 import com.streamline.play.data.settings.AppSettings
 import com.streamline.play.player.EngineKind
 import com.streamline.play.player.ExternalPlayerLauncher
@@ -116,11 +117,16 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         handoffAtMs = 0L
         externalReturnPositionMs = 0L
         baseSettings = container.settingsRepository.current.value
-        val item = when {
+        val source = when {
             !key.streamUrl.isNullOrBlank() && key.streamUrl != catalogItem.url ->
                 catalogItem.copy(url = key.streamUrl)
             else -> catalogItem
         }
+        val stream = StreamUrl.parse(source.url)
+        val item = source.copy(
+            url = stream.url,
+            headers = if (stream.headers.isEmpty()) source.headers else source.headers + stream.headers,
+        )
         val derivedQueue = when (item.type) {
             ContentType.LIVE -> items.filter { it.type == ContentType.LIVE }
             ContentType.SERIES -> items.filter {

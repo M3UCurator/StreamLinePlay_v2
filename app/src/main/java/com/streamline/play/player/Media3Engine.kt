@@ -56,9 +56,11 @@ class Media3Engine(
     private val adaptiveBuffer = AdaptiveBufferManager(settings.bufferTuning)
     private val adaptiveLoadControl =
         AdaptiveLoadControl(adaptiveBuffer, settings.bufferTuning.targetBytes)
+    private val locks = PlaybackLocks(context)
     private var appliedExtraBufferMs = 0
     private var playedOnce = false
     private var playingSinceMs = 0L
+    private var liveRetries = 0
 
     private var currentItem: MediaItem? = null
     private var currentHeaders: Map<String, String> = emptyMap()
@@ -128,6 +130,7 @@ class Media3Engine(
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (isPlaying) {
                     stallRetries = 0
+                    liveRetries = 0
                     recovering = false
                     playingSinceMs = SystemClock.elapsedRealtime()
                     _snapshot.update { it.copy(recovering = false, fatal = false, error = null) }
@@ -159,9 +162,11 @@ class Media3Engine(
         headerProfiles = buildHeaderProfiles(settings, item)
         headerIndex = 0
         stallRetries = 0
+        liveRetries = 0
         recovering = false
         lastStallCheckMs = 0L
         lastStallPositionMs = 0L
+        if (item.isLive) locks.acquire() else locks.release()
         playedOnce = false
         playingSinceMs = 0L
         appliedExtraBufferMs = 0
@@ -237,6 +242,7 @@ class Media3Engine(
 
     override fun release() {
         recoveryScope.cancel()
+        locks.release()
         proxy?.clearAllowedHosts()
         proxy?.updateSessionHeaders(emptyMap())
         runCatching { player.release() }
@@ -308,6 +314,29 @@ class Media3Engine(
     private fun handlePlaybackError(error: PlaybackException) {
         val failure = error.streamFailure()
         val item = currentItem
+        // A live channel that loses its socket reconnects the same source first;
+        // switching to a swapped-protocol backup would only produce a 404.
+        if (item != null && item.isLive && error.isTransientIoError() &&
+            liveRetries < MAX_SILENT_RETRIES
+        ) {
+            liveRetries++
+            recovering = true
+            _snapshot.update {
+                it.copy(
+                    playing = false,
+                    buffering = true,
+                    recovering = true,
+                    fatal = false,
+                    errorCode = failure.code,
+                    error = "Connection dropped · reconnecting live (${liveRetries}/${MAX_SILENT_RETRIES})",
+                )
+            }
+            recoveryScope.launch {
+                delay(RECONNECT_DELAY_MS * liveRetries)
+                startCandidate(candidates.getOrElse(candidateIndex) { item.url }, 0L)
+            }
+            return
+        }
         if (item != null && candidateIndex + 1 < candidates.size) {
             candidateIndex++
             recovering = true

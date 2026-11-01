@@ -38,6 +38,7 @@ class VlcEngine(
 
     private val libVlc = LibVLC(context, buildArguments(settings))
     private val mediaPlayer = MediaPlayer(libVlc)
+    private val locks = PlaybackLocks(context)
     private val recoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var aspect: AspectMode = AspectMode.FIT
     private var durationMs: Long = 0L
@@ -73,6 +74,7 @@ class VlcEngine(
         candidateIndex = 0
         retries = 0
         recovering = false
+        if (item.isLive) locks.acquire() else locks.release()
         startStream(candidates.firstOrNull() ?: item.url, if (item.isLive) 0L else startPositionMs)
     }
 
@@ -156,6 +158,7 @@ class VlcEngine(
 
     override fun release() {
         recoveryScope.cancel()
+        locks.release()
         runCatching { mediaPlayer.stop() }
         runCatching { mediaPlayer.detachViews() }
         runCatching { mediaPlayer.release() }
