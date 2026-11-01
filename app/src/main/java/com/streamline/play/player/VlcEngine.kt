@@ -11,6 +11,7 @@ import com.streamline.play.data.model.ResolutionCap
 import com.streamline.play.data.settings.AppSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -40,6 +41,7 @@ class VlcEngine(
     private val mediaPlayer = MediaPlayer(libVlc)
     private val locks = PlaybackLocks(context)
     private val recoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var recoveryJob: Job? = null
     private var aspect: AspectMode = AspectMode.FIT
     private var durationMs: Long = 0L
     private var currentItem: MediaItem? = null
@@ -48,6 +50,9 @@ class VlcEngine(
     private var candidateIndex = 0
     private var retries = 0
     private var recovering = false
+
+    @Volatile
+    private var released = false
 
     init {
         mediaPlayer.setEventListener { event -> handleEvent(event) }
@@ -68,6 +73,7 @@ class VlcEngine(
         startPositionMs: Long,
         subtitleUrls: List<String>,
     ) {
+        recoveryJob?.cancel()
         currentItem = item
         currentSubtitles = subtitleUrls
         candidates = streamCandidates(item)
@@ -157,7 +163,10 @@ class VlcEngine(
     }
 
     override fun release() {
+        released = true
+        recoveryJob?.cancel()
         recoveryScope.cancel()
+        runCatching { mediaPlayer.setEventListener(null) }
         locks.release()
         runCatching { mediaPlayer.stop() }
         runCatching { mediaPlayer.detachViews() }
@@ -179,9 +188,10 @@ class VlcEngine(
                     error = "Stream dropped · switching to backup ${candidateIndex + 1}/${candidates.size}",
                 )
             }
-            recoveryScope.launch {
+            recoveryJob?.cancel()
+            recoveryJob = recoveryScope.launch {
                 delay(RECONNECT_DELAY_MS)
-                startStream(candidates[candidateIndex], resume)
+                startStream(candidates.getOrElse(candidateIndex) { item.url }, resume)
             }
             return
         }
@@ -195,7 +205,8 @@ class VlcEngine(
                     error = "Reconnecting (${retries}/${MAX_SILENT_RETRIES})…",
                 )
             }
-            recoveryScope.launch {
+            recoveryJob?.cancel()
+            recoveryJob = recoveryScope.launch {
                 delay(RECONNECT_DELAY_MS * retries)
                 startStream(candidates.getOrElse(candidateIndex) { item.url }, resume)
             }
@@ -213,6 +224,7 @@ class VlcEngine(
     }
 
     private fun handleEvent(event: MediaPlayer.Event) {
+        if (released) return
         when (event.type) {
             MediaPlayer.Event.Opening -> _snapshot.update { it.copy(buffering = true, error = null) }
             MediaPlayer.Event.Buffering -> _snapshot.update { it.copy(buffering = true) }

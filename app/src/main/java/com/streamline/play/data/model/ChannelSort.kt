@@ -30,20 +30,37 @@ fun List<MediaItem>.channelGroupOrder(mode: ChannelSortMode): List<String> {
         ChannelSortMode.PLAYLIST -> groups
         ChannelSortMode.NAME_ASC -> groups.sortedWith(String.CASE_INSENSITIVE_ORDER)
         ChannelSortMode.NAME_DESC -> groups.sortedWith(String.CASE_INSENSITIVE_ORDER.reversed())
-        ChannelSortMode.CHANNEL_NUMBER -> groups
-            .withIndex()
-            .sortedWith(
-                compareBy(
-                    { entry ->
-                        this.filter { it.displayGroup == entry.value }
-                            .mapNotNull { it.channelNumber }
-                            .minOrNull() ?: Int.MAX_VALUE
-                    },
-                    { it.index },
-                ),
-            )
-            .map { it.value }
+        ChannelSortMode.CHANNEL_NUMBER -> {
+            val firstNumber = HashMap<String, Int>()
+            for (item in this) {
+                val number = item.channelNumber ?: continue
+                firstNumber.merge(item.displayGroup, number, ::minOf)
+            }
+            groups
+                .withIndex()
+                .sortedWith(
+                    compareBy(
+                        { entry -> firstNumber[entry.value] ?: Int.MAX_VALUE },
+                        { it.index },
+                    ),
+                )
+                .map { it.value }
+        }
     }
+}
+
+/** Channels ordered group by group, sorted inside each group: one pass over the list. */
+fun List<MediaItem>.groupedChannels(mode: ChannelSortMode): List<MediaItem> {
+    if (isEmpty()) return this
+    val order = channelGroupOrder(mode)
+    val buckets = sortedChannels(mode).groupBy { it.displayGroup }
+    val out = ArrayList<MediaItem>(size)
+    order.forEach { group -> buckets[group]?.let(out::addAll) }
+    if (buckets.size > order.size) {
+        val known = order.toHashSet()
+        buckets.forEach { (group, items) -> if (group !in known) out.addAll(items) }
+    }
+    return out
 }
 
 fun String.nameKey(): String = trim().lowercase(Locale.US)

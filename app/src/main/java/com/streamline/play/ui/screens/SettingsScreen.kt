@@ -186,6 +186,7 @@ fun SettingsScreen(
                 contentPadding = PaddingValues(bottom = 12.dp),
             ) {
                 items(SettingsSection.entries, key = { it.name }) { candidate ->
+                    val itemFocus = remember(candidate) { FocusRequester() }
                     RailItem(
                         section = candidate,
                         selected = section == candidate,
@@ -193,7 +194,7 @@ fun SettingsScreen(
                             section = candidate
                             onSectionChanged(candidate)
                         },
-                        focusRequester = if (candidate == initialSection) railFocus else null,
+                        focusRequester = if (candidate == initialSection) railFocus else itemFocus,
                     )
                     Spacer(Modifier.height(6.dp))
                 }

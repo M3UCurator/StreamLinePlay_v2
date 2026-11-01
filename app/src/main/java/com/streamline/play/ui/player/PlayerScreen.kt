@@ -151,7 +151,7 @@ fun PlayerScreen(
     val settings by vm.settings.collectAsStateWithLifecycle()
     val now = rememberNow(15_000L)
 
-    LaunchedEffect(key, catalog.items) {
+    LaunchedEffect(key, catalog.lastUpdatedMs) {
         if (catalog.items.isNotEmpty()) playerVm.start(key, catalog.items)
     }
     DisposableEffect(Unit) {
@@ -483,6 +483,7 @@ fun PlayerScreen(
             }
         }
 
+        // The screen auto-returns after 1.6 s, so the panel only offers the exit it performs.
         if (ui.fatal && !ui.external) {
             StatusPanel(
                 title = "Stream unavailable",
@@ -490,8 +491,6 @@ fun PlayerScreen(
                     ?: "This stream could not be recovered. Returning to the channel list.",
                 primaryLabel = "Back to channel list",
                 onPrimary = { item?.id?.let(onFatalExit) ?: onClose() },
-                secondaryLabel = "Retry",
-                onSecondary = { playerVm.retry() },
                 onBack = { item?.id?.let(onFatalExit) ?: onClose() },
                 modifier = Modifier.align(Alignment.Center),
             )
@@ -584,6 +583,7 @@ private fun PlayerSurface(
                             else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
                         }
                     },
+                    onRelease = { view -> view.player = null },
                     modifier = if (ratio != null) {
                         Modifier
                             .fillMaxHeight()
@@ -1473,9 +1473,9 @@ private fun StatusPanel(
     message: String,
     primaryLabel: String,
     onPrimary: () -> Unit,
-    secondaryLabel: String,
-    onSecondary: () -> Unit,
     onBack: () -> Unit,
+    secondaryLabel: String? = null,
+    onSecondary: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val focus = rememberInitialFocus()
@@ -1509,7 +1509,9 @@ private fun StatusPanel(
                     primary = true,
                     focusRequester = focus,
                 )
-                TvButton(text = secondaryLabel, onClick = onSecondary, primary = false)
+                if (secondaryLabel != null && onSecondary != null) {
+                    TvButton(text = secondaryLabel, onClick = onSecondary, primary = false)
+                }
                 TvButton(text = "Back", onClick = onBack, primary = false)
             }
         }

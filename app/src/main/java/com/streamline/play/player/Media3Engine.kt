@@ -28,6 +28,7 @@ import com.streamline.play.data.settings.AppSettings
 import com.streamline.play.player.proxy.StreamProxyServer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -53,6 +54,7 @@ class Media3Engine(
     private val audioLookup = mutableMapOf<String, TrackRef>()
     private val subtitleLookup = mutableMapOf<String, TrackRef>()
     private val recoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var recoveryJob: Job? = null
     private val adaptiveBuffer = AdaptiveBufferManager(settings.bufferTuning)
     private val adaptiveLoadControl =
         AdaptiveLoadControl(adaptiveBuffer, settings.bufferTuning.targetBytes)
@@ -153,6 +155,7 @@ class Media3Engine(
         startPositionMs: Long,
         subtitleUrls: List<String>,
     ) {
+        recoveryJob?.cancel()
         currentItem = item
         currentSubtitles = subtitleUrls
         currentHeaders = settings.requestHeaders + item.headers
@@ -241,10 +244,12 @@ class Media3Engine(
     }
 
     override fun release() {
+        recoveryJob?.cancel()
         recoveryScope.cancel()
         locks.release()
         proxy?.clearAllowedHosts()
         proxy?.updateSessionHeaders(emptyMap())
+        proxy?.abandonConnections()
         runCatching { player.release() }
     }
 
@@ -331,8 +336,7 @@ class Media3Engine(
                     error = "Connection dropped · reconnecting live (${liveRetries}/${MAX_SILENT_RETRIES})",
                 )
             }
-            recoveryScope.launch {
-                delay(RECONNECT_DELAY_MS * liveRetries)
+            scheduleRecovery(RECONNECT_DELAY_MS * liveRetries) {
                 startCandidate(candidates.getOrElse(candidateIndex) { item.url }, 0L)
             }
             return
@@ -351,9 +355,8 @@ class Media3Engine(
                 )
             }
             val resume = if (item.isLive) 0L else player.currentPosition.coerceAtLeast(0L)
-            recoveryScope.launch {
-                delay(RECONNECT_DELAY_MS)
-                startCandidate(candidates[candidateIndex], resume)
+            scheduleRecovery(RECONNECT_DELAY_MS) {
+                startCandidate(candidates.getOrElse(candidateIndex) { item.url }, resume)
             }
             return
         }
@@ -373,8 +376,7 @@ class Media3Engine(
                 )
             }
             val resume = if (item.isLive) 0L else player.currentPosition.coerceAtLeast(0L)
-            recoveryScope.launch {
-                delay(RECONNECT_DELAY_MS)
+            scheduleRecovery(RECONNECT_DELAY_MS) {
                 startCandidate(candidates.firstOrNull() ?: item.url, resume)
             }
             return
@@ -388,6 +390,15 @@ class Media3Engine(
                 errorCode = failure.code,
                 error = failure.message,
             )
+        }
+    }
+
+    /** A newer prepare/error supersedes any retry still waiting out its backoff. */
+    private fun scheduleRecovery(delayMs: Long, block: suspend () -> Unit) {
+        recoveryJob?.cancel()
+        recoveryJob = recoveryScope.launch {
+            delay(delayMs)
+            block()
         }
     }
 
@@ -429,8 +440,7 @@ class Media3Engine(
                 )
             }
             val resume = if (item.isLive) 0L else position.coerceAtLeast(0L)
-            recoveryScope.launch {
-                delay(RECONNECT_DELAY_MS)
+            scheduleRecovery(RECONNECT_DELAY_MS) {
                 startCandidate(candidates.getOrElse(candidateIndex) { item.url }, resume)
             }
             return
@@ -447,9 +457,8 @@ class Media3Engine(
                 )
             }
             val resume = if (item.isLive) 0L else position.coerceAtLeast(0L)
-            recoveryScope.launch {
-                delay(RECONNECT_DELAY_MS)
-                startCandidate(candidates[candidateIndex], resume)
+            scheduleRecovery(RECONNECT_DELAY_MS) {
+                startCandidate(candidates.getOrElse(candidateIndex) { item.url }, resume)
             }
             return
         }
@@ -467,8 +476,7 @@ class Media3Engine(
                 )
             }
             val resume = if (item.isLive) 0L else position.coerceAtLeast(0L)
-            recoveryScope.launch {
-                delay(RECONNECT_DELAY_MS)
+            scheduleRecovery(RECONNECT_DELAY_MS) {
                 startCandidate(candidates.firstOrNull() ?: item.url, resume)
             }
             return

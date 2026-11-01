@@ -74,8 +74,19 @@ object PakoGunzip {
             }
             return r;
           }
-          var inflated = pako.ungzip(dec(__pakoInput));
-          if (inflated.length > 100663296) { throw new Error('EPG payload too large'); }
+          var CAP = 33554432, chunks = [], total = 0;
+          var inf = new pako.Inflate();
+          inf.onData = function (chunk) {
+            total += chunk.length;
+            if (total > CAP) { throw new Error('EPG payload too large'); }
+            chunks.push(chunk);
+          };
+          inf.push(dec(__pakoInput), true);
+          if (inf.err) { throw new Error('inflate failed'); }
+          var size = 0, i;
+          for (i = 0; i < chunks.length; i++) { size += chunks[i].length; }
+          var inflated = new Uint8Array(size), off = 0;
+          for (i = 0; i < chunks.length; i++) { inflated.set(chunks[i], off); off += chunks[i].length; }
           return enc(inflated);
         })()
     """.trimIndent()

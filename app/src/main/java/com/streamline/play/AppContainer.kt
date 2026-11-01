@@ -11,6 +11,7 @@ import com.streamline.play.data.settings.SettingsRepository
 import com.streamline.play.data.source.SourceRepository
 import com.streamline.play.data.stalker.StalkerClient
 import com.streamline.play.data.xtream.XtreamClient
+import com.streamline.play.player.StreamCache
 import com.streamline.play.player.proxy.StreamProxyServer
 
 class AppContainer(context: Context) {
@@ -34,4 +35,8 @@ class AppContainer(context: Context) {
     val epgRepository = EpgRepository(appContext, httpFetcher, settingsRepository)
     val cacheManager = CacheManager(appContext)
     val streamProxy = StreamProxyServer()
+
+    init {
+        StreamCache.warm(appContext)
+    }
 }

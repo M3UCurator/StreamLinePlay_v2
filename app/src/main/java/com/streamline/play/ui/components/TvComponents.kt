@@ -698,28 +698,32 @@ fun EmptyState(
     modifier: Modifier = Modifier,
     action: (@Composable () -> Unit)? = null,
 ) {
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(48.dp),
-        verticalArrangement = Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.headlineMedium,
-            color = Cinema.TextPrimary,
-        )
-        Spacer(Modifier.height(10.dp))
-        Text(
-            text = message,
-            style = MaterialTheme.typography.bodyLarge,
-            color = Cinema.TextMuted,
-            modifier = Modifier.width(560.dp),
-        )
-        if (action != null) {
-            Spacer(Modifier.height(24.dp))
-            action()
+    // Scrollable so the action button keeps its minimum height on short windows instead of
+    // being squeezed below its label.
+    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 48.dp, vertical = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.headlineMedium,
+                color = Cinema.TextPrimary,
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodyLarge,
+                color = Cinema.TextMuted,
+                modifier = Modifier.width(560.dp),
+            )
+            if (action != null) {
+                Spacer(Modifier.height(24.dp))
+                action()
+            }
         }
     }
 }

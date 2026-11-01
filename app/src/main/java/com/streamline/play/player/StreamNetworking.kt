@@ -2,6 +2,7 @@ package com.streamline.play.player
 
 import android.content.Context
 import android.os.Build
+import android.os.Looper
 import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.HttpDataSource
@@ -86,14 +87,49 @@ object StreamCache {
     @Volatile
     private var cache: SimpleCache? = null
 
-    fun get(context: Context): SimpleCache? = synchronized(this) {
-        cache ?: runCatching {
-            val appContext = context.applicationContext
-            SimpleCache(
-                File(appContext.cacheDir, "media-streams"),
-                LeastRecentlyUsedCacheEvictor(MAX_BYTES),
-                StandaloneDatabaseProvider(appContext),
-            )
-        }.getOrNull().also { cache = it }
+    @Volatile
+    private var warming = false
+
+    private val lock = Any()
+
+    /**
+     * Opening the cache touches SQLite (index database, table creation) and the
+     * filesystem, so the main thread only schedules the work and plays uncached
+     * until it finishes instead of blocking the first VOD prepare.
+     */
+    fun get(context: Context): SimpleCache? {
+        cache?.let { return it }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            warm(context)
+            return null
+        }
+        synchronized(lock) {
+            cache?.let { return it }
+            val created = runCatching { create(context.applicationContext) }.getOrNull()
+            cache = created
+            return created
+        }
     }
+
+    fun warm(context: Context) {
+        if (cache != null || warming) return
+        warming = true
+        val appContext = context.applicationContext
+        Thread({
+            try {
+                synchronized(lock) {
+                    if (cache == null) cache = runCatching { create(appContext) }.getOrNull()
+                }
+            } finally {
+                // A failed attempt must not pin the cache gate shut; the next playback retries.
+                warming = false
+            }
+        }, "stream-cache-init").apply { isDaemon = true }.start()
+    }
+
+    private fun create(appContext: Context): SimpleCache = SimpleCache(
+        File(appContext.cacheDir, "media-streams"),
+        LeastRecentlyUsedCacheEvictor(MAX_BYTES),
+        StandaloneDatabaseProvider(appContext),
+    )
 }

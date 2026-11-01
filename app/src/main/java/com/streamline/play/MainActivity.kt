@@ -30,7 +30,11 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         val container = application.streamLineContainer
         if (container.settingsRepository.current.value.clearCacheOnExit) {
-            container.cacheManager.clearCache()
+            val cacheManager = container.cacheManager
+            Thread({ cacheManager.clearCache() }, "cache-clear-exit").apply {
+                isDaemon = true
+                start()
+            }
         }
         super.onDestroy()
     }

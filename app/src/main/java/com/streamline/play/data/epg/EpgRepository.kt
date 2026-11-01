@@ -10,8 +10,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
+import java.io.FilterInputStream
+import java.io.IOException
+import java.io.InputStream
 import java.util.zip.GZIPInputStream
 
 class EpgRepository(
@@ -33,12 +38,26 @@ class EpgRepository(
     private val _message = MutableStateFlow<String?>(null)
     val message: StateFlow<String?> = _message.asStateFlow()
 
+    /**
+     * Two full guide parses at once can exhaust a 1 GB TV box, so refreshes never overlap.
+     * Waiting callers re-run against the state the finished pass left behind, which also
+     * means a reload that arrives mid-refresh is never dropped.
+     */
+    private val refreshMutex = Mutex()
+
     suspend fun refresh(
         channels: List<MediaItem>,
         epgUrls: List<String>,
         force: Boolean,
     ) = withContext(Dispatchers.IO) {
-        if (_refreshing.value) return@withContext
+        refreshMutex.withLock { refreshGuides(channels, epgUrls, force) }
+    }
+
+    private suspend fun refreshGuides(
+        channels: List<MediaItem>,
+        epgUrls: List<String>,
+        force: Boolean,
+    ) {
         _refreshing.value = true
         try {
             val settings = settingsRepository.current.value
@@ -111,24 +130,35 @@ class EpgRepository(
 
             val cutoffStart = now - 36L * 60L * 60L * 1000L
             val cutoffEnd = now + 7L * 24L * 60L * 60L * 1000L
-            val keysByChannel = HashMap<String, List<String>>()
-            val index = mutableMapOf<String, MutableList<EpgProgram>>()
-
+            // Index once per guide channel and share that list across its alias keys. Indexing
+            // per alias copied every program 5-10x and doubled the live heap on large guides.
+            val byChannel = HashMap<String, MutableList<EpgProgram>>()
             externalPrograms
                 .filter { it.endMs >= cutoffStart && it.startMs <= cutoffEnd }
                 .forEach { program ->
-                    val keys = keysByChannel.getOrPut(program.channelId) {
-                        EpgMatcher.variantKeys(program.channelId, channelNames[program.channelId])
-                    }
-                    keys.forEach { key ->
-                        index.getOrPut(key) { mutableListOf() }.add(program)
-                    }
+                    byChannel.getOrPut(program.channelId) { mutableListOf() }.add(program)
                 }
 
-            val finalIndex = index.mapValues { (_, list) ->
-                list.distinctBy { "${it.startMs}|${it.title}" }.sortedBy { it.startMs }
+            // Channels from two sources can normalise to the same alias key; merge their
+            // programmes instead of letting an arbitrary channel win the key.
+            val index = HashMap<String, List<EpgProgram>>(byChannel.size * 8)
+            byChannel.forEach { (channelId, collected) ->
+                val programs = collected
+                    .distinctBy { "${it.startMs}|${it.title}" }
+                    .sortedBy { it.startMs }
+                val keys = EpgMatcher.variantKeys(channelId, channelNames[channelId])
+                keys.forEach { key ->
+                    val existing = index[key]
+                    index[key] = if (existing == null) {
+                        programs
+                    } else {
+                        (existing + programs)
+                            .distinctBy { "${it.startMs}|${it.title}" }
+                            .sortedBy { it.startMs }
+                    }
+                }
             }
-            _programs.value = finalIndex
+            _programs.value = index
             if (fetchedAt > 0L) _lastRefreshMs.value = maxOf(_lastRefreshMs.value, fetchedAt)
             _message.value = error
         } finally {
@@ -163,8 +193,9 @@ class EpgRepository(
         if (!isGzip(bytes)) {
             return ByteArrayInputStream(bytes).use { parser.parse(it) }
         }
+        val limit = HttpFetcher.MAX_PAYLOAD_BYTES.toLong()
         val native = runCatching {
-            GZIPInputStream(ByteArrayInputStream(bytes)).use { parser.parse(it) }
+            GZIPInputStream(ByteArrayInputStream(bytes)).use { parser.parse(CappedStream(it, limit)) }
         }
         native.getOrNull()?.let { return it }
         val inflated = PakoGunzip.ungzip(context, bytes)
@@ -172,6 +203,30 @@ class EpgRepository(
             throw native.exceptionOrNull() ?: IllegalStateException("Unable to inflate EPG guide")
         }
         return ByteArrayInputStream(inflated).use { parser.parse(it) }
+    }
+
+    /** Stops a compressed guide from inflating past the same ceiling as a plain download. */
+    private class CappedStream(input: InputStream, private val limit: Long) : FilterInputStream(input) {
+        private var total = 0L
+
+        override fun read(): Int {
+            val value = super.read()
+            if (value >= 0) advance(1)
+            return value
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            val count = super.read(b, off, len)
+            if (count > 0) advance(count)
+            return count
+        }
+
+        private fun advance(count: Int) {
+            total += count
+            if (total > limit) {
+                throw IOException("Inflated guide exceeds ${limit / (1024 * 1024)} MB")
+            }
+        }
     }
 
     private fun isGzip(bytes: ByteArray): Boolean =

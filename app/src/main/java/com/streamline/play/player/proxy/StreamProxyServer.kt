@@ -16,6 +16,7 @@ import java.net.URL
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.zip.GZIPInputStream
 import kotlin.concurrent.thread
 
@@ -34,6 +35,8 @@ class StreamProxyServer(
     private val signer = ProxySigner()
     private val allowlist = CopyOnWriteArraySet<String>()
     private val cookieJars = ConcurrentHashMap<String, MutableMap<String, String>>()
+    private val liveSockets = ConcurrentHashMap<Socket, Unit>()
+    private val activeRequests = AtomicInteger(0)
     private val running = AtomicBoolean(false)
 
     @Volatile
@@ -66,6 +69,14 @@ class StreamProxyServer(
         running.set(false)
         runCatching { serverSocket?.close() }
         serverSocket = null
+        abandonConnections()
+        cookieJars.clear()
+    }
+
+    /** Drops in-flight segment requests so their threads unwind when playback ends. */
+    fun abandonConnections() {
+        liveSockets.keys.forEach { socket -> runCatching { socket.close() } }
+        liveSockets.clear()
     }
 
     /** Signed loopback URL for [target]; falls back to the direct URL if the port is unavailable. */
@@ -95,7 +106,27 @@ class StreamProxyServer(
     private fun acceptLoop(socket: ServerSocket) {
         while (running.get() && !socket.isClosed) {
             val client = runCatching { socket.accept() }.getOrNull() ?: break
-            thread(name = "stream-proxy-io", isDaemon = true) { serve(client) }
+            if (activeRequests.incrementAndGet() > MAX_CONNECTIONS) {
+                activeRequests.decrementAndGet()
+                runCatching { client.close() }
+                continue
+            }
+            liveSockets[client] = Unit
+            val started = runCatching {
+                thread(name = "stream-proxy-io", isDaemon = true) {
+                    try {
+                        serve(client)
+                    } finally {
+                        liveSockets.remove(client)
+                        activeRequests.decrementAndGet()
+                    }
+                }
+            }.isSuccess
+            if (!started) {
+                liveSockets.remove(client)
+                activeRequests.decrementAndGet()
+                runCatching { client.close() }
+            }
         }
     }
 
@@ -287,6 +318,9 @@ class StreamProxyServer(
 
     private fun storeCookies(host: String?, connection: HttpURLConnection) {
         if (host.isNullOrBlank()) return
+        if (cookieJars.size >= MAX_COOKIE_HOSTS && !cookieJars.containsKey(host.lowercase())) {
+            cookieJars.keys.firstOrNull()?.let(cookieJars::remove)
+        }
         val jar = cookieJars.getOrPut(host.lowercase()) { ConcurrentHashMap() }
         runCatching {
             connection.headerFields.forEach { (name, values) ->
@@ -456,6 +490,8 @@ class StreamProxyServer(
         private const val MAX_HEADER_BYTES = 8 * 1024
         private const val MAX_PLAYLIST_BYTES = 8 * 1024 * 1024
         private const val MAX_COOKIES_PER_HOST = 48
+        private const val MAX_COOKIE_HOSTS = 16
+        private const val MAX_CONNECTIONS = 32
         private const val COPY_BUFFER_BYTES = 64 * 1024
         private const val PLAYLIST_CONTENT_TYPE = "application/vnd.apple.mpegurl"
         private const val DEFAULT_UA = "StreamLine/1.0"

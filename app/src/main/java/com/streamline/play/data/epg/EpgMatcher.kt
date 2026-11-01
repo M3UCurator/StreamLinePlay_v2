@@ -41,6 +41,8 @@ object EpgMatcher {
     private val LEADING_CHANNEL_NUMBER = Regex("^0*\\d{2,4}\\s+(?=\\p{L})(.+)$")
     private val NON_WORD = Regex("[^\\p{L}\\p{N}']+")
     private val MARKS = Regex("\\p{M}+")
+    private val COMPACT = Regex("[^\\p{L}\\p{N}]")
+    private val WHITESPACE = Regex("\\s+")
 
     /**
      * Index keys for a guide channel:
@@ -152,10 +154,10 @@ object EpgMatcher {
         out += text
         val sorted = text.split(' ').filter { it.isNotBlank() }.sorted().joinToString(" ")
         if (sorted != text) out += SORTED_PREFIX + sorted
-        val compact = text.replace(Regex("[^\\p{L}\\p{N}]"), "")
+        val compact = text.replace(COMPACT, "")
         if (compact.isNotBlank()) out += COMPACT_PREFIX + compact
     }
 
     private fun collapse(value: String): String =
-        value.replace(Regex("\\s+"), " ").trim()
+        value.replace(WHITESPACE, " ").trim()
 }

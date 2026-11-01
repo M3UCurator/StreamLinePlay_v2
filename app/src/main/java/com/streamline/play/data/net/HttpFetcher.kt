@@ -48,11 +48,12 @@ class HttpFetcher {
         headers: Map<String, String> = emptyMap(),
         timeoutMs: Int = 20_000,
         attempts: Int = 3,
+        maxBytes: Int = MAX_PAYLOAD_BYTES,
     ): ByteArray = withContext(Dispatchers.IO) {
         var last: Throwable? = null
         repeat(attempts.coerceAtLeast(1)) { attempt ->
             runCatching {
-                fetch(url, headers, timeoutMs).use { it.readBytes() }
+                fetch(url, headers, timeoutMs).use { readCapped(it, maxBytes) }
             }.onSuccess {
                 return@withContext it
             }.onFailure { error ->
@@ -64,8 +65,24 @@ class HttpFetcher {
         throw last ?: IOException("Unable to download $url")
     }
 
+    /** Refuses to buffer an oversized guide instead of growing until the box runs out of heap. */
+    private fun readCapped(input: java.io.InputStream, maxBytes: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream(minOf(maxBytes, 64 * 1024))
+        val buffer = ByteArray(32 * 1024)
+        var total = 0
+        while (true) {
+            val read = input.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > maxBytes) throw IOException("Payload exceeds ${maxBytes / (1024 * 1024)} MB limit")
+            out.write(buffer, 0, read)
+        }
+        return out.toByteArray()
+    }
+
     private fun isRetryable(error: Throwable): Boolean {
         val message = error.message.orEmpty()
+        if (message.startsWith("Payload exceeds")) return false
         val httpCode = Regex("HTTP (\\d{3})").find(message)?.groupValues?.get(1)?.toIntOrNull()
         return httpCode == null || httpCode == 408 || httpCode == 425 || httpCode == 429 || httpCode in 500..599
     }
@@ -114,5 +131,9 @@ class HttpFetcher {
             return stream
         }
         throw IOException("Too many redirects")
+    }
+
+    companion object {
+        const val MAX_PAYLOAD_BYTES = 32 * 1024 * 1024
     }
 }

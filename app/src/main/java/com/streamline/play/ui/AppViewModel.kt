@@ -34,15 +34,13 @@ data class CatalogState(
     val errors: List<String> = emptyList(),
     val lastUpdatedMs: Long = 0L,
 ) {
-    val liveChannels: List<MediaItem>
-        get() = items.filter { it.type == ContentType.LIVE }
-    val movies: List<MediaItem>
-        get() = items.filter { it.type == ContentType.MOVIE }
-    val episodes: List<MediaItem>
-        get() = items.filter { it.type == ContentType.SERIES }
-            .sortedWith(compareBy({ it.seriesName.orEmpty() }, { it.season ?: 0 }, { it.episode ?: 0 }))
-    val groups: List<String>
-        get() = liveChannels.map { it.displayGroup }.distinct()
+    // Derived once per catalog update: these are read by the shell and every screen
+    // recomposition, and walking 20k items each time dominated TV frame time.
+    val liveChannels: List<MediaItem> = items.filter { it.type == ContentType.LIVE }
+    val movies: List<MediaItem> = items.filter { it.type == ContentType.MOVIE }
+    val episodes: List<MediaItem> = items.filter { it.type == ContentType.SERIES }
+        .sortedWith(compareBy({ it.seriesName.orEmpty() }, { it.season ?: 0 }, { it.episode ?: 0 }))
+    val groups: List<String> = liveChannels.map { it.displayGroup }.distinct()
 }
 
 class AppViewModel(application: Application) : AndroidViewModel(application) {

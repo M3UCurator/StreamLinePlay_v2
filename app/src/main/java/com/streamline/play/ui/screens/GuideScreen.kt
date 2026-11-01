@@ -40,8 +40,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.streamline.play.data.m3u.M3uParser
 import com.streamline.play.data.model.EpgProgram
 import com.streamline.play.data.model.MediaItem
-import com.streamline.play.data.model.channelGroupOrder
-import com.streamline.play.data.model.sortedChannels
+import com.streamline.play.data.model.groupedChannels
 import com.streamline.play.ui.AppViewModel
 import com.streamline.play.ui.FocusRestore
 import com.streamline.play.ui.components.EmptyState
@@ -85,17 +84,15 @@ fun GuideScreen(
     val windowEnd = windowStart + totalMs
     val nowFraction = ((now - windowStart).toFloat() / totalMs.toFloat()).coerceIn(0f, 1f)
     val sort = settings.channelSort
-    val channels = remember(catalog.liveChannels, sort) {
-        val groupsOrder = catalog.liveChannels.channelGroupOrder(sort)
-        groupsOrder.flatMap { group ->
-            catalog.liveChannels.filter { it.displayGroup == group }.sortedChannels(sort)
-        }
+    val channels = remember(catalog.lastUpdatedMs, catalog.items.size, sort) {
+        catalog.liveChannels.groupedChannels(sort)
     }
     val listState = rememberLazyListState()
     val requesters = remember { HashMap<String, FocusRequester>() }
     val emptyFocus = rememberInitialFocus(enabled = channels.isEmpty())
 
     LaunchedEffect(restore?.token, sort, channels.size) {
+        requesters.keys.retainAll(channels.mapTo(HashSet()) { it.id })
         val index = restore?.itemId?.let { id -> channels.indexOfFirst { it.id == id } } ?: -1
         if (index >= 0) {
             listState.scrollToItem(index)
