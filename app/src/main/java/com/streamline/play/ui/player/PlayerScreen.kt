@@ -1,6 +1,7 @@
 package com.streamline.play.ui.player
 
 import android.content.Intent
+import android.view.SurfaceView
 import android.view.ViewGroup
 import android.graphics.Color as AndroidColor
 import androidx.activity.compose.BackHandler
@@ -39,8 +40,10 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.AspectRatio
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.GraphicEq
+import androidx.compose.material.icons.rounded.HighQuality
 import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.LiveTv
 import androidx.compose.material.icons.rounded.Memory
@@ -82,6 +85,7 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -94,12 +98,17 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import com.streamline.play.data.model.AspectMode
+import com.streamline.play.data.model.DecoderMode
 import com.streamline.play.data.model.EpgProgram
 import com.streamline.play.data.model.MediaItem
+import com.streamline.play.data.model.ResolutionCap
 import com.streamline.play.data.model.channelGroupOrder
 import com.streamline.play.data.model.sortedChannels
+import com.streamline.play.player.DisplayRefreshRateMatcher
 import com.streamline.play.player.EngineKind
+import com.streamline.play.player.PlaybackEngine
 import com.streamline.play.player.TrackOption
+import com.streamline.play.player.findHostActivity
 import com.streamline.play.ui.AppViewModel
 import com.streamline.play.ui.components.DialogHeader
 import com.streamline.play.ui.components.DialogOption
@@ -129,6 +138,8 @@ import kotlin.math.roundToInt
 
 private enum class PlayerOverlay {
     ASPECT,
+    DECODER,
+    QUALITY,
     AUDIO,
     SUBTITLES,
     INFO,
@@ -213,6 +224,21 @@ fun PlayerScreen(
             delay(1_600)
             item?.id?.let(onFatalExit) ?: onClose()
         }
+    }
+
+    // Pin the TV refresh rate to the source cadence (23.976/24/25/50/60 Hz).
+    LaunchedEffect(settings.matchRefreshRate, ui.frameRate, ui.status, ui.external) {
+        val activity = context.findHostActivity() ?: return@LaunchedEffect
+        if (settings.matchRefreshRate && !ui.external &&
+            ui.status == PlayerStatus.READY && ui.frameRate > 0f
+        ) {
+            DisplayRefreshRateMatcher.apply(activity, ui.frameRate)
+        } else {
+            DisplayRefreshRateMatcher.restore(activity)
+        }
+    }
+    DisposableEffect(Unit) {
+        onDispose { context.findHostActivity()?.let(DisplayRefreshRateMatcher::restore) }
     }
 
     BackHandler(enabled = osdVisible || sidebarOpen || overflowOpen || overlay != null) {
@@ -303,20 +329,6 @@ fun PlayerScreen(
                         }
                     }
                 }
-            }
-            .pointerInput(ui.external, sidebarOpen, overflowOpen) {
-                detectTapGestures {
-                    if (ui.external) return@detectTapGestures
-                    when {
-                        sidebarOpen -> sidebarOpen = false
-                        overflowOpen -> {
-                            overflowOpen = false
-                            osdVisible = true
-                        }
-                        else -> osdVisible = !osdVisible
-                    }
-                    interaction++
-                }
             },
     ) {
         Box(
@@ -342,6 +354,27 @@ fun PlayerScreen(
 
         PlayerSurface(playerVm = playerVm, state = ui, modifier = Modifier.fillMaxSize())
 
+        // media3's PlayerView swallows taps on the video, so a transparent catcher
+        // above the surface owns the show/hide gesture for the whole picture.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(ui.external, sidebarOpen, overflowOpen) {
+                    detectTapGestures {
+                        if (ui.external) return@detectTapGestures
+                        when {
+                            sidebarOpen -> sidebarOpen = false
+                            overflowOpen -> {
+                                overflowOpen = false
+                                osdVisible = true
+                            }
+                            else -> osdVisible = !osdVisible
+                        }
+                        interaction++
+                    }
+                },
+        )
+
         if (osdVisible && !ui.external && !sidebarOpen && !overflowOpen && overlay == null) {
             OsdScrims()
             PlayerOsd(
@@ -359,6 +392,7 @@ fun PlayerScreen(
                 onPrevious = { playerVm.playPrevious() },
                 onNext = { playerVm.playNext() },
                 onChannels = { sidebarOpen = true },
+                onQuality = { overlay = PlayerOverlay.QUALITY },
                 onAspect = { overlay = PlayerOverlay.ASPECT },
                 onAudio = { overlay = PlayerOverlay.AUDIO },
                 onExternal = { playerVm.openExternal() },
@@ -387,7 +421,11 @@ fun PlayerScreen(
                 },
                 onDecoder = {
                     overflowOpen = false
-                    playerVm.cycleDecoder()
+                    overlay = PlayerOverlay.DECODER
+                },
+                onUltraSharp = {
+                    overflowOpen = false
+                    playerVm.toggleUltraSharp()
                 },
                 onSubtitles = {
                     overflowOpen = false
@@ -425,6 +463,26 @@ fun PlayerScreen(
                 current = ui.aspect,
                 onPick = { mode ->
                     playerVm.setAspect(mode)
+                    overlay = null
+                },
+                onClose = { overlay = null },
+            )
+            PlayerOverlay.DECODER -> DecoderDialog(
+                current = ui.decoder,
+                onPick = { mode ->
+                    playerVm.setDecoder(mode)
+                    overlay = null
+                },
+                onClose = { overlay = null },
+            )
+            PlayerOverlay.QUALITY -> QualityDialog(
+                state = ui,
+                onPickCap = { cap ->
+                    playerVm.setQuality(cap)
+                    overlay = null
+                },
+                onPickRendition = { id ->
+                    playerVm.selectVideo(id)
                     overlay = null
                 },
                 onClose = { overlay = null },
@@ -556,10 +614,23 @@ private fun PlayerSurface(
     state: PlayerUiState,
     modifier: Modifier = Modifier,
 ) {
+    val density = LocalDensity.current
     val ratio = when (state.aspect) {
         AspectMode.RATIO_16_9 -> 16f / 9f
-        AspectMode.RATIO_4_3 -> 4f / 3f
+        AspectMode.RATIO_18_9 -> 18f / 9f
         else -> null
+    }
+    val nativeSize = if (state.aspect == AspectMode.ORIGINAL &&
+        state.videoWidth > 0 && state.videoHeight > 0
+    ) {
+        with(density) { state.videoWidth.toDp() to state.videoHeight.toDp() }
+    } else {
+        null
+    }
+    val surfaceSize = when {
+        nativeSize != null -> Modifier.size(nativeSize.first, nativeSize.second)
+        ratio != null -> Modifier.fillMaxHeight().aspectRatio(ratio)
+        else -> Modifier.fillMaxSize()
     }
     Box(modifier = modifier.background(Color.Black), contentAlignment = Alignment.Center) {
         when (state.engineKind) {
@@ -578,19 +649,16 @@ private fun PlayerSurface(
                     update = { view ->
                         view.player = playerVm.media3Player
                         view.resizeMode = when (state.aspect) {
-                            AspectMode.ZOOM -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                            AspectMode.CROP -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                             AspectMode.STRETCH -> AspectRatioFrameLayout.RESIZE_MODE_FILL
                             else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
                         }
+                        (view.videoSurfaceView as? SurfaceView)?.let { surface ->
+                            DisplayRefreshRateMatcher.applySurfaceFrameRate(surface, state.frameRate)
+                        }
                     },
                     onRelease = { view -> view.player = null },
-                    modifier = if (ratio != null) {
-                        Modifier
-                            .fillMaxHeight()
-                            .aspectRatio(ratio)
-                    } else {
-                        Modifier.fillMaxSize()
-                    },
+                    modifier = surfaceSize,
                 )
             }
             EngineKind.VLC -> composeKey(state.engineSerial) {
@@ -651,12 +719,14 @@ private fun PlayerOsd(
     onPrevious: () -> Unit,
     onNext: () -> Unit,
     onChannels: () -> Unit,
+    onQuality: () -> Unit,
     onAspect: () -> Unit,
     onAudio: () -> Unit,
     onExternal: () -> Unit,
     onOverflow: () -> Unit,
 ) {
     val actionsFocus = remember { FocusRequester() }
+    val qualityFocus = remember { FocusRequester() }
     val aspectFocus = remember { FocusRequester() }
     val audioFocus = remember { FocusRequester() }
     val externalFocus = remember { FocusRequester() }
@@ -886,8 +956,20 @@ private fun PlayerOsd(
                     icon = Icons.Rounded.LiveTv,
                     label = "Channels",
                     onClick = onChannels,
-                    modifier = Modifier.focusProperties { up = playFocus; right = aspectFocus },
+                    modifier = Modifier.focusProperties { up = playFocus; right = qualityFocus },
                     focusRequester = actionsFocus,
+                )
+                OsdIcon(
+                    icon = Icons.Rounded.HighQuality,
+                    label = "Quality",
+                    onClick = onQuality,
+                    active = state.quality != ResolutionCap.AUTO,
+                    modifier = Modifier.focusProperties {
+                        up = playFocus
+                        left = actionsFocus
+                        right = aspectFocus
+                    },
+                    focusRequester = qualityFocus,
                 )
                 OsdIcon(
                     icon = Icons.Rounded.AspectRatio,
@@ -895,7 +977,7 @@ private fun PlayerOsd(
                     onClick = onAspect,
                     modifier = Modifier.focusProperties {
                         up = playFocus
-                        left = actionsFocus
+                        left = qualityFocus
                         right = audioFocus
                     },
                     focusRequester = aspectFocus,
@@ -1060,6 +1142,7 @@ private fun OverflowMenu(
     onBoost: () -> Unit,
     onRefresh: () -> Unit,
     onDecoder: () -> Unit,
+    onUltraSharp: () -> Unit,
     onSubtitles: () -> Unit,
 ) {
     Column(
@@ -1078,7 +1161,17 @@ private fun OverflowMenu(
             trailing = "+${state.audioBoostSteps}",
         )
         MenuRow(Icons.Rounded.Refresh, "Refresh stream", onRefresh)
-        MenuRow(Icons.Rounded.Memory, "Decoder", onDecoder, trailing = state.decoderLabel)
+        MenuRow(Icons.Rounded.Memory, "Decoder", onDecoder, trailing = state.decoder.label)
+        MenuRow(
+            Icons.Rounded.AutoAwesome,
+            "Ultra Sharp 4K upscaling",
+            onUltraSharp,
+            trailing = when {
+                state.ultraSharpActive -> "On"
+                state.ultraSharp -> "Starting…"
+                else -> "Off"
+            },
+        )
         MenuRow(Icons.Rounded.Subtitles, "Subtitles / CC", onSubtitles)
     }
 }
@@ -1287,17 +1380,129 @@ private fun AspectDialog(
     TvDialog(onDismiss = onClose) {
         DialogHeader(
             title = "Aspect ratio",
-            subtitle = "Fit, zoom or stretch the picture to fill your TV",
+            subtitle = "Original, fit, fixed ratios, stretch or crop",
         )
         AspectMode.entries.forEach { mode ->
             DialogOption(
                 label = mode.label,
                 selected = mode == current,
+                supporting = mode.detail,
                 onClick = { onPick(mode) },
                 focusRequester = if (mode == current) focus else null,
             )
         }
         Spacer(Modifier.height(18.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            TvButton(text = "Close", onClick = onClose, primary = false)
+        }
+    }
+}
+
+@Composable
+private fun DecoderDialog(
+    current: DecoderMode,
+    onPick: (DecoderMode) -> Unit,
+    onClose: () -> Unit,
+) {
+    val focus = rememberInitialFocus()
+    TvDialog(onDismiss = onClose) {
+        DialogHeader(
+            title = "Decoder",
+            subtitle = "Switch between automatic, hardware and software decoding",
+        )
+        DecoderMode.entries.forEach { mode ->
+            DialogOption(
+                label = mode.label,
+                selected = mode == current,
+                supporting = mode.detail,
+                onClick = { onPick(mode) },
+                focusRequester = if (mode == current) focus else null,
+            )
+        }
+        Spacer(Modifier.height(18.dp))
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            TvButton(text = "Close", onClick = onClose, primary = false)
+        }
+    }
+}
+
+@Composable
+private fun QualityDialog(
+    state: PlayerUiState,
+    onPickCap: (ResolutionCap) -> Unit,
+    onPickRendition: (String) -> Unit,
+    onClose: () -> Unit,
+) {
+    val focus = rememberInitialFocus()
+    val caps = listOf(
+        ResolutionCap.AUTO,
+        ResolutionCap.UHD_4K,
+        ResolutionCap.FHD_1080,
+        ResolutionCap.HD_720,
+        ResolutionCap.SD_480,
+        ResolutionCap.SD_360,
+    )
+    TvDialog(onDismiss = onClose, width = 680.dp) {
+        DialogHeader(
+            title = "Stream quality",
+            subtitle = "Cap the adaptive ladder or pin a rendition that exists in this stream",
+        )
+        Column(
+            modifier = Modifier
+                .heightIn(max = 470.dp)
+                .verticalScroll(rememberScrollState()),
+        ) {
+            Text(
+                text = "RESOLUTION CAP",
+                style = MaterialTheme.typography.labelMedium,
+                color = Cinema.TextMuted,
+            )
+            caps.forEach { cap ->
+                DialogOption(
+                    label = if (cap == ResolutionCap.AUTO) "Auto · best available" else cap.label,
+                    selected = state.quality == cap,
+                    supporting = when (cap) {
+                        ResolutionCap.AUTO -> "Adaptive ABR picks the best rendition for the network"
+                        ResolutionCap.UHD_4K -> "Up to 3840×2160 · heaviest on cellular"
+                        ResolutionCap.FHD_1080 -> "Up to 1920×1080"
+                        ResolutionCap.HD_720 -> "Up to 1280×720 · smoother on weak Wi-Fi"
+                        ResolutionCap.SD_480 -> "Up to 854×480 · lightest for slow links"
+                        ResolutionCap.SD_360 -> "Up to 640×360 · minimum data use"
+                    },
+                    onClick = { onPickCap(cap) },
+                    focusRequester = if (state.quality == cap) focus else null,
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            Text(
+                text = "STREAMS IN THIS CHANNEL",
+                style = MaterialTheme.typography.labelMedium,
+                color = Cinema.TextMuted,
+            )
+            if (state.videoRenditions.isEmpty()) {
+                Text(
+                    text = "This stream exposes a single rendition, so only the cap applies.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Cinema.TextMuted,
+                )
+            } else {
+                DialogOption(
+                    label = "Adaptive (Auto)",
+                    selected = state.selectedRenditionId == null,
+                    supporting = "Let the player switch renditions as bandwidth changes",
+                    onClick = { onPickRendition(PlaybackEngine.VIDEO_AUTO) },
+                )
+                state.videoRenditions.forEach { rendition ->
+                    DialogOption(
+                        label = rendition.label,
+                        selected = state.selectedRenditionId == rendition.id,
+                        supporting = "Pinned rendition",
+                        onClick = { onPickRendition(rendition.id) },
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(16.dp))
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             TvButton(text = "Close", onClick = onClose, primary = false)
         }
@@ -1420,6 +1625,18 @@ private fun InfoDialog(
                 },
             )
             InfoRow("Bitrate", if (state.bitrate > 0) formatBitrate(state.bitrate) else "—")
+            InfoRow(
+                "Quality cap",
+                if (state.activeCap == ResolutionCap.AUTO) {
+                    "Adaptive · best available"
+                } else {
+                    state.activeCap.label
+                },
+            )
+            InfoRow(
+                "Upscaling",
+                if (state.ultraSharpActive) "Ultra Sharp · Lanczos + sharpen" else "Off",
+            )
             InfoRow("Audio tracks", state.audioTracks.size.toString())
             InfoRow("Subtitles", state.subtitleTracks.size.toString())
             if (program != null) {

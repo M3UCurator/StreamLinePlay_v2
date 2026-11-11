@@ -441,6 +441,22 @@ private fun androidx.compose.foundation.lazy.LazyListScope.playbackSection(
         )
     }
     item {
+        SettingRow(
+            label = "Match display refresh rate",
+            value = if (settings.matchRefreshRate) "On" else "Off",
+            caption = "Switches the TV to 23.976 / 24 / 25 / 50 / 60 Hz to match the video and remove judder",
+            onClick = { vm.updateSettings { it.copy(matchRefreshRate = !it.matchRefreshRate) } },
+        )
+    }
+    item {
+        SettingRow(
+            label = "Ultra Sharp 4K upscaling",
+            value = if (settings.ultraSharpUpscaling) "On" else "Off",
+            caption = "GPU Lanczos upscale plus sharpening for 480p/720p/1080p sources on Media3",
+            onClick = { vm.updateSettings { it.copy(ultraSharpUpscaling = !it.ultraSharpUpscaling) } },
+        )
+    }
+    item {
         SectionHeader(
             title = "D-pad remote",
             subtitle = "Every card and action is reachable with UP, DOWN, LEFT and RIGHT",

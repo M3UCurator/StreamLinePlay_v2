@@ -1,9 +1,12 @@
 package com.streamline.play.player
 
 import android.content.Context
+import android.hardware.display.DisplayManager
 import android.net.Uri
 import android.os.SystemClock
+import android.view.Display
 import androidx.media3.common.C
+import androidx.media3.common.Effect
 import androidx.media3.common.Format
 import androidx.media3.common.MediaItem as ExoItem
 import androidx.media3.common.MimeTypes
@@ -21,9 +24,11 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
+import androidx.media3.effect.LanczosResample
 import com.streamline.play.data.model.AspectMode
 import com.streamline.play.data.model.DecoderMode
 import com.streamline.play.data.model.MediaItem
+import com.streamline.play.data.model.ResolutionCap
 import com.streamline.play.data.settings.AppSettings
 import com.streamline.play.player.proxy.StreamProxyServer
 import kotlinx.coroutines.CoroutineScope
@@ -38,6 +43,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 
 class Media3Engine(
     private val context: Context,
@@ -54,6 +60,12 @@ class Media3Engine(
     val player: ExoPlayer
     private val audioLookup = mutableMapOf<String, TrackRef>()
     private val subtitleLookup = mutableMapOf<String, TrackRef>()
+    private val videoLookup = mutableMapOf<String, TrackRef>()
+    private var userCap: ResolutionCap = settings.resolutionCap
+    private var autoCap: ResolutionCap = ResolutionCap.AUTO
+    private var ultraSharpEnabled: Boolean = settings.ultraSharpUpscaling
+    private var effectsActive = false
+    private var effectsFailed = false
     private val recoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var recoveryJob: Job? = null
     private var probeJob: Job? = null
@@ -150,6 +162,7 @@ class Media3Engine(
             override fun onPlayerError(error: PlaybackException) = handlePlaybackError(error)
         })
         player.playWhenReady = true
+        applyVideoEffects()
     }
 
     override fun prepare(
@@ -177,9 +190,11 @@ class Media3Engine(
         playedOnce = false
         playingSinceMs = 0L
         appliedExtraBufferMs = 0
+        autoCap = ResolutionCap.AUTO
         adaptiveBuffer.reset()
         adaptiveLoadControl.refresh()
-        _snapshot.value = EngineSnapshot(buffering = true)
+        applyVideoCap(userCap)
+        _snapshot.value = EngineSnapshot(buffering = true, activeCap = userCap, ultraSharpActive = effectsActive)
         val startUrl = candidates.firstOrNull() ?: item.url
         if (streamMime(startUrl) == null && !probedFormats.containsKey(startUrl)) {
             probeFormatThenStart(startUrl, currentStartPositionMs)
@@ -247,6 +262,110 @@ class Media3Engine(
         val item = currentItem ?: return
         currentSubtitles = currentSubtitles + url
         prepare(item, settings, player.currentPosition, currentSubtitles)
+    }
+
+    override fun setQualityCap(cap: ResolutionCap) {
+        userCap = cap
+        autoCap = ResolutionCap.AUTO
+        val builder = player.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+        applyCapTo(builder, cap)
+        runCatching { player.trackSelectionParameters = builder.build() }
+        _snapshot.update { it.copy(activeCap = cap) }
+    }
+
+    override fun selectVideo(id: String) {
+        if (id == PlaybackEngine.VIDEO_AUTO) {
+            autoCap = ResolutionCap.AUTO
+            val builder = player.trackSelectionParameters.buildUpon()
+                .clearOverridesOfType(C.TRACK_TYPE_VIDEO)
+            applyCapTo(builder, userCap)
+            runCatching { player.trackSelectionParameters = builder.build() }
+            _snapshot.update { it.copy(activeCap = userCap) }
+            return
+        }
+        val ref = videoLookup[id] ?: return
+        val builder = player.trackSelectionParameters.buildUpon()
+            .setMaxVideoSize(Int.MAX_VALUE, Int.MAX_VALUE)
+            .setOverrideForType(TrackSelectionOverride(ref.group, listOf(ref.index)))
+        runCatching { player.trackSelectionParameters = builder.build() }
+    }
+
+    override fun setUltraSharp(enabled: Boolean) {
+        ultraSharpEnabled = enabled
+        effectsFailed = false
+        applyVideoEffects()
+    }
+
+    private fun applyCapTo(
+        builder: TrackSelectionParameters.Builder,
+        cap: ResolutionCap,
+    ) {
+        builder.setMaxVideoSize(cap.maxWidth, cap.maxHeight)
+        if (settings.maxVideoBitrateBps > 0) builder.setMaxVideoBitrate(settings.maxVideoBitrateBps)
+    }
+
+    private fun applyVideoCap(cap: ResolutionCap) {
+        val builder = player.trackSelectionParameters.buildUpon()
+        applyCapTo(builder, cap)
+        runCatching { player.trackSelectionParameters = builder.build() }
+        _snapshot.update { it.copy(activeCap = cap) }
+    }
+
+    /** GPU Lanczos upscale to the panel size plus an unsharp pass; disabled if GL setup fails. */
+    private fun applyVideoEffects() {
+        if (!ultraSharpEnabled || effectsFailed) {
+            runCatching { player.setVideoEffects(emptyList()) }
+            effectsActive = false
+            _snapshot.update { it.copy(ultraSharpActive = false) }
+            return
+        }
+        val (width, height) = panelSize()
+        val effects: List<Effect> = listOf(
+            LanczosResample.scaleToFit(width, height),
+            UltraSharpEffect(),
+        )
+        val applied = runCatching { player.setVideoEffects(effects) }.isSuccess
+        if (!applied) effectsFailed = true
+        effectsActive = applied
+        _snapshot.update { it.copy(ultraSharpActive = applied) }
+    }
+
+    private fun panelSize(): Pair<Int, Int> {
+        val display = (context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager)
+            ?.getDisplay(Display.DEFAULT_DISPLAY)
+        val mode = display?.mode
+        val rawWidth = mode?.physicalWidth?.takeIf { it > 0 }
+            ?: context.resources.displayMetrics.widthPixels
+        val rawHeight = mode?.physicalHeight?.takeIf { it > 0 }
+            ?: context.resources.displayMetrics.heightPixels
+        val scale = minOf(1f, MAX_UPSCALE_WIDTH.toFloat() / rawWidth, MAX_UPSCALE_HEIGHT.toFloat() / rawHeight)
+        return (rawWidth * scale).toInt().coerceAtLeast(2) to (rawHeight * scale).toInt().coerceAtLeast(2)
+    }
+
+    /** Weak-network guard: step the adaptive ladder down before reconnecting. */
+    private fun autoDownscale(): Boolean {
+        if (userCap != ResolutionCap.AUTO || currentItem == null) return false
+        val height = player.videoSize.height
+        val current = when {
+            autoCap != ResolutionCap.AUTO -> autoCap
+            height >= 2000 -> ResolutionCap.UHD_4K
+            height >= 1000 -> ResolutionCap.FHD_1080
+            height >= 700 -> ResolutionCap.HD_720
+            height >= 450 -> ResolutionCap.SD_480
+            height > 0 -> ResolutionCap.SD_360
+            else -> ResolutionCap.FHD_1080
+        }
+        val next = when (current) {
+            ResolutionCap.AUTO, ResolutionCap.UHD_4K -> ResolutionCap.FHD_1080
+            ResolutionCap.FHD_1080 -> ResolutionCap.HD_720
+            ResolutionCap.HD_720 -> ResolutionCap.SD_480
+            ResolutionCap.SD_480 -> ResolutionCap.SD_360
+            ResolutionCap.SD_360 -> return false
+        }
+        autoCap = next
+        applyVideoCap(next)
+        return true
     }
 
     override fun refresh() {
@@ -348,6 +467,25 @@ class Media3Engine(
     private fun handlePlaybackError(error: PlaybackException) {
         val failure = error.streamFailure()
         val item = currentItem
+        // A GPU effect that cannot run must not take the stream down: retry plainly once.
+        if (effectsActive && error.errorCode == PlaybackException.ERROR_CODE_VIDEO_FRAME_PROCESSING_FAILED) {
+            effectsFailed = true
+            effectsActive = false
+            runCatching { player.setVideoEffects(emptyList()) }
+            _snapshot.update {
+                it.copy(
+                    buffering = true,
+                    recovering = true,
+                    ultraSharpActive = false,
+                    error = "Ultra Sharp unavailable on this GPU · continuing without it",
+                )
+            }
+            val target = candidates.getOrNull(candidateIndex) ?: item?.url ?: return
+            scheduleRecovery(RECONNECT_DELAY_MS) {
+                startCandidate(target, 0L)
+            }
+            return
+        }
         // A live channel that loses its socket reconnects the same source first;
         // switching to a swapped-protocol backup would only produce a 404.
         if (item != null && item.isLive && error.isTransientIoError() &&
@@ -458,6 +596,8 @@ class Media3Engine(
 
         lastStallCheckMs = now
         val item = currentItem ?: return
+        val downscaled = autoDownscale()
+        val qualityNote = if (downscaled) " · lowering to ${autoCap.shortLabel}" else ""
         if (stallRetries < MAX_SILENT_RETRIES) {
             stallRetries++
             recovering = true
@@ -465,7 +605,7 @@ class Media3Engine(
                 it.copy(
                     buffering = true,
                     recovering = true,
-                    error = "Stream stalled · reconnecting (${stallRetries}/${MAX_SILENT_RETRIES})",
+                    error = "Stream stalled · reconnecting (${stallRetries}/${MAX_SILENT_RETRIES})$qualityNote",
                 )
             }
             val resume = if (item.isLive) 0L else position.coerceAtLeast(0L)
@@ -482,7 +622,7 @@ class Media3Engine(
                 it.copy(
                     buffering = true,
                     recovering = true,
-                    error = "Switching to backup stream ${candidateIndex + 1}/${candidates.size}",
+                    error = "Switching to backup stream ${candidateIndex + 1}/${candidates.size}$qualityNote",
                 )
             }
             val resume = if (item.isLive) 0L else position.coerceAtLeast(0L)
@@ -501,7 +641,7 @@ class Media3Engine(
                 it.copy(
                     buffering = true,
                     recovering = true,
-                    error = "Rebuffering · retrying as ${next.label}",
+                    error = "Rebuffering · retrying as ${next.label}$qualityNote",
                 )
             }
             val resume = if (item.isLive) 0L else position.coerceAtLeast(0L)
@@ -580,11 +720,34 @@ class Media3Engine(
     private fun publishTracks(tracks: Tracks) {
         audioLookup.clear()
         subtitleLookup.clear()
+        videoLookup.clear()
         val audio = mutableListOf<TrackOption>()
         val subtitles = mutableListOf<TrackOption>()
+        val renditions = mutableListOf<TrackOption>()
 
         tracks.groups.forEachIndexed { groupIndex, group ->
             when (group.type) {
+                C.TRACK_TYPE_VIDEO -> {
+                    for (trackIndex in 0 until group.length) {
+                        val format = group.getTrackFormat(trackIndex)
+                        val id = "vid:$groupIndex:$trackIndex"
+                        videoLookup[id] = TrackRef(group.mediaTrackGroup, trackIndex)
+                        val label = videoRenditionLabel(format)
+                        val selected = group.isTrackSelected(trackIndex)
+                        val existing = renditions.indexOfFirst { it.label == label }
+                        if (existing < 0) {
+                            renditions += TrackOption(
+                                id = id,
+                                label = label,
+                                selected = selected,
+                                bitrateHint = format.bitrate,
+                            )
+                        } else if (selected) {
+                            renditions[existing] = renditions[existing].copy(selected = true)
+                        }
+                    }
+                }
+
                 C.TRACK_TYPE_AUDIO -> {
                     for (trackIndex in 0 until group.length) {
                         val format = group.getTrackFormat(trackIndex)
@@ -613,7 +776,30 @@ class Media3Engine(
                 }
             }
         }
-        _snapshot.update { it.copy(audioTracks = audio, subtitleTracks = subtitles) }
+        _snapshot.update {
+            it.copy(
+                audioTracks = audio,
+                subtitleTracks = subtitles,
+                videoRenditions = renditions.sortedByDescending { rendition -> rendition.bitrateHint },
+            )
+        }
+    }
+
+    private fun videoRenditionLabel(format: Format): String {
+        val height = format.height
+        val name = when {
+            height >= 2000 -> "2160p"
+            height >= 1000 -> "1080p"
+            height >= 700 -> "720p"
+            height >= 450 -> "480p"
+            height > 0 -> "${height}p"
+            else -> "Source"
+        }
+        return if (format.bitrate > 0) {
+            String.format(Locale.US, "%s · %.1f Mbps", name, format.bitrate / 1_000_000f)
+        } else {
+            name
+        }
     }
 
     private fun formatLabel(format: Format, index: Int, prefix: String): String {
@@ -640,6 +826,8 @@ class Media3Engine(
         private const val RECONNECT_DELAY_MS = 900L
         private const val STALL_TIMEOUT_MS = 15_000L
         private const val MAX_PROBED_FORMATS = 64
+        private const val MAX_UPSCALE_WIDTH = 3840
+        private const val MAX_UPSCALE_HEIGHT = 2160
         private const val VLC_UA = "VLC/3.0.20 LibVLC/3.0.20"
         private const val DEFAULT_EXO_UA = "ExoPlayerLib/2.18.1"
         private const val BROWSER_UA =

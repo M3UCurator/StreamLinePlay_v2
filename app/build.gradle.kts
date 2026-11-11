@@ -118,6 +118,7 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-dash:1.9.0")
     implementation("androidx.media3:media3-datasource-okhttp:1.9.0")
     implementation("androidx.media3:media3-ui:1.9.0")
+    implementation("androidx.media3:media3-effect:1.9.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jellyfin.media3:media3-ffmpeg-decoder:1.9.0+1")
     implementation("org.videolan.android:libvlc-all:3.7.7")

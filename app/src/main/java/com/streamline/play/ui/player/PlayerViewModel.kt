@@ -16,6 +16,7 @@ import com.streamline.play.data.model.DecoderMode
 import com.streamline.play.data.model.ExternalPlayerApp
 import com.streamline.play.data.model.MediaItem
 import com.streamline.play.data.model.PlaybackEngineType
+import com.streamline.play.data.model.ResolutionCap
 import com.streamline.play.data.model.StreamUrl
 import com.streamline.play.data.settings.AppSettings
 import com.streamline.play.player.EngineKind
@@ -53,7 +54,14 @@ data class PlayerUiState(
     val engineKind: EngineKind? = null,
     val engineSerial: Int = 0,
     val engineLabel: String = "Media3 ExoPlayer",
+    val decoder: DecoderMode = DecoderMode.AUTO,
     val decoderLabel: String = "Auto",
+    val quality: ResolutionCap = ResolutionCap.AUTO,
+    val activeCap: ResolutionCap = ResolutionCap.AUTO,
+    val ultraSharp: Boolean = false,
+    val ultraSharpActive: Boolean = false,
+    val videoRenditions: List<TrackOption> = emptyList(),
+    val selectedRenditionId: String? = null,
     val error: String? = null,
     val errorCode: Int? = null,
     val fatal: Boolean = false,
@@ -96,6 +104,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
     private var playerKey: PlayerKey? = null
     private var baseSettings: AppSettings = container.settingsRepository.current.value
     private var decoderOverride: DecoderMode? = null
+    private var qualityOverride: ResolutionCap? = null
+    private var ultraSharpOverride: Boolean? = null
     private val subtitleUrls = mutableListOf<String>()
 
     /** Kept across an external handoff so playback can continue where it stopped. */
@@ -112,6 +122,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         playerKey = key
         subtitleUrls.clear()
         decoderOverride = null
+        qualityOverride = null
+        ultraSharpOverride = null
         savedPositionMs = 0L
         handoffPositionMs = 0L
         handoffAtMs = 0L
@@ -151,6 +163,14 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 externalMessage = null,
                 audioTracks = emptyList(),
                 subtitleTracks = emptyList(),
+                videoRenditions = emptyList(),
+                selectedRenditionId = null,
+                decoder = baseSettings.decoderMode,
+                decoderLabel = baseSettings.decoderMode.label,
+                quality = baseSettings.resolutionCap,
+                activeCap = baseSettings.resolutionCap,
+                ultraSharp = baseSettings.ultraSharpUpscaling,
+                ultraSharpActive = false,
                 audioBoostSteps = 0,
             )
         }
@@ -189,6 +209,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 catchup = false,
                 audioTracks = emptyList(),
                 subtitleTracks = emptyList(),
+                videoRenditions = emptyList(),
+                selectedRenditionId = null,
+                activeCap = qualityOverride ?: baseSettings.resolutionCap,
             )
         }
         beginPlayback(item, restartEngine = false, resumeMs = 0L)
@@ -234,15 +257,59 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         _state.update { it.copy(message = "Stream refreshed") }
     }
 
-    fun cycleDecoder() {
-        val order = listOf(DecoderMode.AUTO, DecoderMode.HW, DecoderMode.HW_PLUS, DecoderMode.SW)
-        val active = decoderOverride ?: baseSettings.decoderMode
-        val next = order[(order.indexOf(active) + 1) % order.size]
-        decoderOverride = next
+    fun setDecoder(mode: DecoderMode) {
+        decoderOverride = mode
         val item = _current.value ?: return
         val resume = if (item.isLive) 0L else internalPosition(item)
         launchBuiltIn(item, baseSettings, restartEngine = true, resumeMs = resume)
-        _state.update { it.copy(message = "Decoder: ${next.label}") }
+        _state.update { it.copy(message = "Decoder: ${mode.label}") }
+    }
+
+    fun setQuality(cap: ResolutionCap) {
+        qualityOverride = cap
+        _state.update {
+            it.copy(
+                quality = cap,
+                selectedRenditionId = null,
+                message = if (cap == ResolutionCap.AUTO) {
+                    "Quality: adaptive (best available)"
+                } else {
+                    "Quality capped at ${cap.shortLabel}"
+                },
+            )
+        }
+        engine?.setQualityCap(cap)
+    }
+
+    fun selectVideo(id: String) {
+        val engine = engine ?: return
+        engine.selectVideo(id)
+        if (id == PlaybackEngine.VIDEO_AUTO) {
+            _state.update {
+                it.copy(
+                    selectedRenditionId = null,
+                    message = "Adaptive quality restored",
+                )
+            }
+            return
+        }
+        val label = _state.value.videoRenditions.firstOrNull { it.id == id }?.label ?: "Stream"
+        _state.update {
+            it.copy(selectedRenditionId = id, message = "Pinned $label")
+        }
+    }
+
+    fun toggleUltraSharp() {
+        val next = !_state.value.ultraSharp
+        ultraSharpOverride = next
+        _state.update {
+            it.copy(
+                ultraSharp = next,
+                message = if (next) "Ultra Sharp upscaling on" else "Ultra Sharp upscaling off",
+            )
+        }
+        engine?.setUltraSharp(next)
+        container.settingsRepository.update { it.copy(ultraSharpUpscaling = next) }
     }
 
     fun switchEngine() {
@@ -489,6 +556,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                     engineKind = created.kind,
                     engineSerial = it.engineSerial + 1,
                     engineLabel = if (created.kind == EngineKind.VLC) "VLC Engine" else "Media3 ExoPlayer",
+                    decoder = mode,
                     decoderLabel = mode.label,
                     status = PlayerStatus.PREPARING,
                     error = null,
@@ -502,6 +570,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
         runCatching {
             active.prepare(item, settings, resumeMs, subtitleUrls.toList())
             active.setAspect(_state.value.aspect)
+            active.setQualityCap(qualityOverride ?: settings.resolutionCap)
+            active.setUltraSharp(ultraSharpOverride ?: settings.ultraSharpUpscaling)
         }.onFailure { error ->
             _state.update {
                 it.copy(
@@ -550,6 +620,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application) 
                 bitrate = snap.bitrate,
                 audioTracks = snap.audioTracks,
                 subtitleTracks = snap.subtitleTracks,
+                videoRenditions = snap.videoRenditions,
+                activeCap = snap.activeCap,
+                ultraSharpActive = snap.ultraSharpActive,
             )
         }
         if (snap.fatal && !_state.value.external) {

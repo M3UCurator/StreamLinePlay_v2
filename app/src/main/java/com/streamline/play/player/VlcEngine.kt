@@ -43,6 +43,7 @@ class VlcEngine(
     private val recoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var recoveryJob: Job? = null
     private var aspect: AspectMode = AspectMode.FIT
+    private var qualityCap: ResolutionCap = settings.resolutionCap
     private var durationMs: Long = 0L
     private var currentItem: MediaItem? = null
     private var currentSubtitles: List<String> = emptyList()
@@ -76,6 +77,7 @@ class VlcEngine(
         recoveryJob?.cancel()
         currentItem = item
         currentSubtitles = subtitleUrls
+        qualityCap = settings.resolutionCap
         candidates = streamCandidates(item)
         candidateIndex = 0
         retries = 0
@@ -148,6 +150,14 @@ class VlcEngine(
         runCatching {
             mediaPlayer.addSlave(IMedia.Slave.Type.Subtitle, Uri.parse(url), true)
         }
+    }
+
+    override fun setQualityCap(cap: ResolutionCap) {
+        if (qualityCap == cap && currentItem != null) return
+        qualityCap = cap
+        val item = currentItem ?: return
+        val resume = if (item.isLive) 0L else runCatching { mediaPlayer.getTime() }.getOrDefault(0L)
+        startStream(candidates.getOrElse(candidateIndex) { item.url }, resume)
     }
 
     override fun refresh() {
@@ -295,11 +305,13 @@ class VlcEngine(
         runCatching {
             mediaPlayer.setVideoScale(
                 when (aspect) {
+                    AspectMode.ORIGINAL -> MediaPlayer.ScaleType.SURFACE_ORIGINAL
                     AspectMode.FIT -> MediaPlayer.ScaleType.SURFACE_BEST_FIT
-                    AspectMode.ZOOM -> MediaPlayer.ScaleType.SURFACE_FILL
-                    AspectMode.STRETCH -> MediaPlayer.ScaleType.SURFACE_FILL
                     AspectMode.RATIO_16_9 -> MediaPlayer.ScaleType.SURFACE_16_9
-                    AspectMode.RATIO_4_3 -> MediaPlayer.ScaleType.SURFACE_4_3
+                    // libVLC has no 18:9 preset; FILL fills the surface without bars.
+                    AspectMode.RATIO_18_9 -> MediaPlayer.ScaleType.SURFACE_FILL
+                    AspectMode.STRETCH -> MediaPlayer.ScaleType.SURFACE_FIT_SCREEN
+                    AspectMode.CROP -> MediaPlayer.ScaleType.SURFACE_FILL
                 },
             )
         }
@@ -309,7 +321,7 @@ class VlcEngine(
 
     /** Forces VLC's HLS/adaptive demuxer into the requested quality tier. */
     private fun addQualityOptions(media: Media) {
-        val cap = settings.resolutionCap
+        val cap = qualityCap
         if (cap != ResolutionCap.AUTO) {
             media.addOption(":adaptive-maxwidth=${cap.maxWidth}")
             media.addOption(":adaptive-maxheight=${cap.maxHeight}")

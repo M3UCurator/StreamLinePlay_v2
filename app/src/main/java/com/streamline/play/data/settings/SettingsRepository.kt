@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.streamline.play.data.model.AspectMode
 import com.streamline.play.data.model.BitrateLimit
 import com.streamline.play.data.model.BufferPreset
 import com.streamline.play.data.model.ChannelSortMode
@@ -58,6 +59,8 @@ class SettingsRepository(private val context: Context) {
         val origin = stringPreferencesKey("origin")
         val authorization = stringPreferencesKey("authorization")
         val streamProxy = booleanPreferencesKey("stream_proxy")
+        val matchRefreshRate = booleanPreferencesKey("match_refresh_rate")
+        val ultraSharp = booleanPreferencesKey("ultra_sharp")
         val epgRefreshMode = stringPreferencesKey("epg_refresh_mode")
         val globalEpgUrls = stringPreferencesKey("global_epg_urls")
         val clearCacheOnExit = booleanPreferencesKey("clear_cache_on_exit")
@@ -102,6 +105,8 @@ class SettingsRepository(private val context: Context) {
         origin = this[Keys.origin].orEmpty(),
         authorization = this[Keys.authorization].orEmpty(),
         streamProxyEnabled = this[Keys.streamProxy] ?: true,
+        matchRefreshRate = this[Keys.matchRefreshRate] ?: true,
+        ultraSharpUpscaling = this[Keys.ultraSharp] ?: false,
         epgRefreshMode = enumOr(Keys.epgRefreshMode, EpgRefreshMode.AUTO_24H),
         globalEpgUrls = this[Keys.globalEpgUrls]
             ?.lineSequence()
@@ -111,10 +116,7 @@ class SettingsRepository(private val context: Context) {
             .orEmpty(),
         clearCacheOnExit = this[Keys.clearCacheOnExit] ?: false,
         epgLastRefreshMs = this[Keys.epgLastRefresh] ?: 0L,
-        preferredAspect = enumOr(
-            Keys.preferredAspect,
-            com.streamline.play.data.model.AspectMode.FIT,
-        ),
+        preferredAspect = aspectOr(this[Keys.preferredAspect]),
         channelSort = enumOr(Keys.channelSort, ChannelSortMode.PLAYLIST),
         parentalLockEnabled = this[Keys.parentalEnabled] ?: false,
         parentalPinHash = this[Keys.parentalPin].orEmpty(),
@@ -130,6 +132,14 @@ class SettingsRepository(private val context: Context) {
         "KBPS_8000" -> 8_000
         "KBPS_25000" -> BitrateLimit.MAX_KBPS
         else -> BitrateLimit.AUTO
+    }
+
+    /** "Zoom / fill" and "Force 4:3" were replaced by Crop / Fit in the OSD refactor. */
+    private fun aspectOr(stored: String?): AspectMode = when (stored) {
+        "ZOOM" -> AspectMode.CROP
+        "RATIO_4_3" -> AspectMode.FIT
+        null -> AspectMode.FIT
+        else -> AspectMode.entries.firstOrNull { it.name == stored } ?: AspectMode.FIT
     }
 
     private inline fun <reified T : Enum<T>> Preferences.enumOr(
@@ -155,6 +165,8 @@ class SettingsRepository(private val context: Context) {
             prefs[Keys.origin] = settings.origin
             prefs[Keys.authorization] = settings.authorization
             prefs[Keys.streamProxy] = settings.streamProxyEnabled
+            prefs[Keys.matchRefreshRate] = settings.matchRefreshRate
+            prefs[Keys.ultraSharp] = settings.ultraSharpUpscaling
             prefs[Keys.epgRefreshMode] = settings.epgRefreshMode.name
             prefs[Keys.globalEpgUrls] = settings.globalEpgUrls.joinToString("\n")
             prefs[Keys.clearCacheOnExit] = settings.clearCacheOnExit

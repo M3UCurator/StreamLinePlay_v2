@@ -35,6 +35,10 @@ data class AppSettings(
     val authorization: String = "",
     /** Routes HLS playback through the signed loopback proxy. */
     val streamProxyEnabled: Boolean = true,
+    /** Switches the TV display mode to match the video frame rate. */
+    val matchRefreshRate: Boolean = true,
+    /** GPU Lanczos upscale plus sharpening for SD/HD sources. */
+    val ultraSharpUpscaling: Boolean = false,
     val epgRefreshMode: EpgRefreshMode = EpgRefreshMode.AUTO_24H,
     /** App-wide XMLTV guides applied to every loaded playlist. */
     val globalEpgUrls: List<String> = emptyList(),

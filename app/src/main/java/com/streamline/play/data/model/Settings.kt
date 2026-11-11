@@ -34,6 +34,9 @@ enum class ResolutionCap(val label: String, val shortLabel: String, val maxWidth
     FHD_1080("1080p Full HD", "1080p", 1920, 1080),
     HD_720("720p HD", "720p", 1280, 720),
     SD_480("SD (480p)", "480p", 854, 480),
+    SD_360("360p", "360p", 640, 360);
+
+    val isCapped: Boolean get() = this != AUTO
 }
 
 object BitrateLimit {
@@ -143,10 +146,13 @@ enum class EpgRefreshMode(val label: String) {
     MANUAL("Manual refresh only"),
 }
 
-enum class AspectMode(val label: String) {
-    FIT("Fit to screen"),
-    ZOOM("Zoom / fill"),
-    STRETCH("Stretch"),
-    RATIO_16_9("Force 16:9"),
-    RATIO_4_3("Force 4:3"),
+enum class AspectMode(val label: String, val detail: String) {
+    ORIGINAL("Original", "Native source size, centred on screen"),
+    FIT("Fit", "Scale to the screen and keep the source shape"),
+    RATIO_16_9("16:9", "Force the picture into a 16:9 frame"),
+    RATIO_18_9("18:9", "Force the picture into a wide 18:9 frame"),
+    STRETCH("Stretch", "Fill the screen and ignore the source shape"),
+    CROP("Crop", "Fill the screen and crop the edges");
+
+    val isForcedRatio: Boolean get() = this == RATIO_16_9 || this == RATIO_18_9
 }
